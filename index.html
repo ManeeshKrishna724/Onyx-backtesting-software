@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Onyx</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M7 4v16M17 4v16"/><rect x="4.5" y="8" width="5" height="7" rx="1" fill="currentColor" stroke="none"/><rect x="14.5" y="6" width="5" height="9" rx="1" fill="currentColor" stroke="none"/></svg>
+      </div>
+      <div class="brand-text">
+        <h1>Onyx</h1>
+      </div>
+      <span class="symbol-chip" id="symbolChip" title="Instrument" hidden></span>
+    </div>
+
+    <div class="tf-wrap">
+      <div class="timeframes" id="timeframes">
+        <button data-tf="1">1m</button>
+        <button data-tf="2">2m</button>
+        <button data-tf="3">3m</button>
+        <button data-tf="5">5m</button>
+        <button data-tf="10">10m</button>
+        <button data-tf="15">15m</button>
+        <button data-tf="30">30m</button>
+        <button data-tf="45">45m</button>
+        <span class="tf-sep"></span>
+        <button data-tf="60">1h</button>
+        <button data-tf="120">2h</button>
+        <button data-tf="180">3h</button>
+        <button data-tf="240">4h</button>
+        <span class="tf-sep"></span>
+        <button data-tf="1D">1D</button>
+        <button data-tf="1W">1W</button>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button id="acctBtn" class="btn btn-secondary acct-btn" title="Demo account">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="13" rx="2"/><path d="M3 10h18M16 14.5h2"/></svg>
+        <span id="acctBal" class="acct-bal">$100,000.00</span>
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <button id="indicatorsBtn" class="btn btn-secondary" title="Indicators">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l5-6 4 3 8-9"/><path d="M3 21h18"/></svg>
+        Indicators
+      </button>
+      <button id="chartSettingsBtn" class="btn-icon" title="Chart settings">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h.1a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v.1a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+      </button>
+      <label class="btn btn-primary upload-btn">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M7 9l5-5 5 5M4 20h16"/></svg>
+        Upload data
+        <input type="file" id="fileInput" accept=".txt,.csv" multiple hidden />
+      </label>
+      <button id="clearCacheBtn" class="btn btn-ghost-danger clear-btn">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>
+        Clear cache
+      </button>
+      <div class="trade-box" id="tradeBox" title="Market order">
+        <button id="sellBtn" type="button" class="tb-btn sell"><span class="tb-side">Sell</span><span class="tb-px" id="sellPx">&mdash;</span></button>
+        <input id="qtyInput" class="tb-qty" type="number" min="1" max="10000" step="1" value="1" title="Contracts" />
+        <button id="buyBtn" type="button" class="tb-btn buy"><span class="tb-side">Buy</span><span class="tb-px" id="buyPx">&mdash;</span></button>
+      </div>
+    </div>
+  </header>
+
+  <main class="chart-shell">
+    <div id="chart" class="chart-container"></div>
+  </main>
+
+  <footer class="statusbar" id="statusBar">
+    <div class="sb-left">
+      <span class="sb-chip" id="sbTf">1m</span>
+      <span class="sb-chip replay" id="sbReplay" hidden>Replay</span>
+      <span id="fileName" class="file-name"></span>
+    </div>
+    <div class="sb-right" title="Time of the latest candle (New York time)">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+      <span id="sbTime">&mdash;</span>
+    </div>
+  </footer>
+
+  <!-- Replay Toolbar -->
+  <div class="replay-toolbar">
+    <div class="drag-handle">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="5" r="2"/><circle cx="15" cy="5" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="9" cy="19" r="2"/><circle cx="15" cy="19" r="2"/></svg>
+    </div>
+    <div class="divider"></div>
+    <button id="btn-select-bar" class="replay-btn text-btn">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 19l-7-7 7-7"/><path d="M4 12h16"/><path d="M4 5v14"/></svg>
+      Select bar
+    </button>
+    <div class="divider"></div>
+    <button id="btn-skip-1" class="replay-btn icon-btn" title="Skip 1 candle">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 4v16l11-8z"/><path d="M19 5v14"/></svg>
+    </button>
+    <button id="btn-skip-5" class="replay-btn icon-btn" title="Skip 5 candles">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4v16l8-8z"/><path d="M12 4v16l8-8z"/><path d="M22 5v14"/></svg>
+    </button>
+    <div class="divider"></div>
+    <button id="btn-exit-replay" class="replay-btn icon-btn" title="Exit Replay">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+    </button>
+  </div>
+
+  <!-- TradingView-style Drawing Toolbar -->
+  <div class="dt-toolbar" id="drawToolbar">
+    <div class="dt-grip" id="dtGrip"><svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor"><circle cx="2" cy="2" r="1"/><circle cx="7" cy="2" r="1"/><circle cx="2" cy="7" r="1"/><circle cx="7" cy="7" r="1"/><circle cx="2" cy="12" r="1"/><circle cx="7" cy="12" r="1"/></svg></div>
+    <button data-tool="line" class="draw-btn" title="Trend Line (Alt+T)">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.2"><line x1="7.5" y1="20.5" x2="20.5" y2="7.5"/><circle cx="6" cy="22" r="2"/><circle cx="22" cy="6" r="2"/></svg>
+    </button>
+    <button data-tool="vline" class="draw-btn" title="Vertical Line (Alt+V)">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.2"><line x1="14" y1="4" x2="14" y2="24"/><circle cx="14" cy="14" r="2" fill="#131313"/></svg>
+    </button>
+    <button data-tool="hray" class="draw-btn" title="Horizontal Ray (Alt+J)">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.2"><line x1="9" y1="14" x2="24" y2="14"/><circle cx="7" cy="14" r="2" fill="#131313"/></svg>
+    </button>
+    <button data-tool="hline" class="draw-btn" title="Horizontal Line (Alt+H)">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.2"><line x1="4" y1="14" x2="24" y2="14"/><circle cx="14" cy="14" r="2" fill="#131313"/></svg>
+    </button>
+    <button data-tool="rect" class="draw-btn" title="Rectangle (Alt+Shift+S)">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="7" y="7" width="14" height="14"/><circle cx="7" cy="7" r="2" fill="#131313"/><circle cx="21" cy="7" r="2" fill="#131313"/><circle cx="7" cy="21" r="2" fill="#131313"/><circle cx="21" cy="21" r="2" fill="#131313"/></svg>
+    </button>
+    <button data-tool="fib" class="draw-btn" title="Fib Retracement (Alt+F)">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.2"><line x1="5" y1="7" x2="23" y2="7"/><line x1="5" y1="14" x2="23" y2="14"/><line x1="5" y1="21" x2="23" y2="21"/><circle cx="23" cy="14" r="2" fill="#131313"/><circle cx="5" cy="21" r="2" fill="#131313"/></svg>
+    </button>
+    <button data-tool="short" class="draw-btn" title="Short Position (Alt+S)">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.2"><line x1="7" y1="7" x2="22" y2="7"/><line x1="7" y1="21" x2="22" y2="21"/><circle cx="6" cy="7" r="2" fill="#131313"/><circle cx="6" cy="21" r="2" fill="#131313"/><circle cx="22" cy="7" r="2" fill="#131313"/><text x="14" y="17.5" font-size="8" font-family="sans-serif" fill="currentColor" stroke="none" text-anchor="middle">S</text></svg>
+    </button>
+    <button data-tool="long" class="draw-btn" title="Long Position (Alt+D)">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.2"><line x1="7" y1="7" x2="22" y2="7"/><line x1="7" y1="21" x2="22" y2="21"/><circle cx="6" cy="7" r="2" fill="#131313"/><circle cx="6" cy="21" r="2" fill="#131313"/><circle cx="22" cy="21" r="2" fill="#131313"/><text x="14" y="17.5" font-size="8" font-family="sans-serif" fill="currentColor" stroke="none" text-anchor="middle">L</text></svg>
+    </button>
+    <div class="dt-sep"></div>
+    <button id="btn-clear-draw" class="draw-btn" title="Remove all drawings">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>
+    </button>
+    <button id="btn-toolbar-orient" class="draw-btn" title="Switch to horizontal toolbar">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="4" y="5" width="6" height="14" rx="1"/>
+        <path d="M14 8h6M14 12h6M14 16h6"/>
+      </svg>
+    </button>
+  </div>
+
+  <!-- Floating Selection Toolbar (appears when a drawing is selected) -->
+  <div id="editToolbar" class="edit-toolbar">
+    <div id="ftButtons" class="ft-buttons"></div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
