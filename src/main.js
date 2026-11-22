@@ -473,19 +473,6 @@ function buildSeriesForView(tf, fullSeries = null) {
   return visible;
 }
 
-/** During replay, append whitespace (time-only) bars after the cursor so the
- *  time axis still shows dates/times of candles that have not formed yet. */
-function seriesDataForChart(displayData) {
-  if (replayTimestamp == null || !currentDataCache.length) return displayData;
-  const lastT = displayData.length ? getComparableTime(displayData[displayData.length - 1].time) : null;
-  const out = displayData.slice();
-  for (let i = 0; i < currentDataCache.length; i++) {
-    const t = getComparableTime(currentDataCache[i].time);
-    if (lastT == null || t > lastT) out.push({ time: currentDataCache[i].time });
-  }
-  return out;
-}
-
 function getComparableTime(timeVal) {
   if (timeVal == null) return null;
   if (typeof timeVal === 'number' && isFinite(timeVal)) return timeVal;
@@ -593,7 +580,7 @@ function applyTimeframe(tf, skipZoom = false, preserveView = false) {
   const displayData = buildSeriesForView(tf, currentDataCache);
   replayRawIndex = replayTimestamp == null ? -1 : rawIndexAtOrBefore(replayTimestamp);
 
-  candleSeries.setData(seriesDataForChart(displayData));
+  candleSeries.setData(displayData);
   displayLen = displayData.length;
   shownData = displayData;
   window._dataStartIdx = 0;
@@ -767,25 +754,56 @@ function stepReplay(steps) {
   }
   if (targetIdx === cur) return;
 
-  // Rebuild from the raw cursor. Using setData (instead of incremental update)
-  // keeps whitespace future bars on the time axis in sync and avoids skip buttons
-  // stalling when the series already contains time-only placeholders.
+  // Backward stepping rebuilds the visible aggregate safely.
+  if (targetIdx < cur) {
+    replayRawIndex = targetIdx;
+    replayTimestamp = getComparableTime(rawCandles[targetIdx].time) + 59;
+    const rebuilt = buildSeriesForView(currentTimeframe);
+    candleSeries.setData(rebuilt);
+    shownData = rebuilt;
+    displayLen = rebuilt.length;
+    ctRef = null;
+  } else {
+    // Forward: incremental update — only the new bars, no full history rebuild
+    for (let i = cur + 1; i <= targetIdx; i++) {
+      const raw = rawCandles[i];
+      const rawTime = getComparableTime(raw.time);
+      let next;
+
+      if (isOneMinute) {
+        next = { time: rawTime, open: raw.open, high: raw.high, low: raw.low, close: raw.close, volume: raw.volume || 0 };
+        shownData.push(next);
+        displayLen = shownData.length;
+        candleSeries.update(next);
+      } else {
+        const bucketTime = getSessionAlignedKey(rawTime, currentTimeframe);
+        const last = shownData[shownData.length - 1];
+        const lastTime = last ? getComparableTime(last.time) : null;
+        if (last && lastTime === getComparableTime(bucketTime)) {
+          last.high = Math.max(last.high, raw.high);
+          last.low = Math.min(last.low, raw.low);
+          last.close = raw.close;
+          last.volume = (last.volume || 0) + (raw.volume || 0);
+          next = last;
+        } else {
+          next = { time: bucketTime, open: raw.open, high: raw.high, low: raw.low, close: raw.close, volume: raw.volume || 0 };
+          shownData.push(next);
+          displayLen = shownData.length;
+        }
+        candleSeries.update(next);
+      }
+    }
+    displayLen = shownData.length;
+  }
+
   replayRawIndex = targetIdx;
   replayTimestamp = getComparableTime(rawCandles[targetIdx].time) + 59;
-  const rebuilt = buildSeriesForView(currentTimeframe);
-  try {
-    candleSeries.setData(seriesDataForChart(rebuilt));
-  } catch (e) {
-    try { candleSeries.setData(rebuilt); } catch (e2) { /* ignore */ }
-  }
-  shownData = rebuilt;
-  displayLen = rebuilt.length;
-  ctRef = null;
   updateStatusBar(shownData);
   dirty = true;
   scheduleIndicatorSync(80);
   updateGoToLatestBtn();
 }
+
 
 document.getElementById('btn-skip-1').addEventListener('click', () => stepReplay(1));
 document.getElementById('btn-skip-5').addEventListener('click', () => stepReplay(5));
@@ -861,7 +879,7 @@ function goToSession(sessionKey) {
   if (selBtn) selBtn.classList.remove('active');
   chartContainer.style.cursor = 'default';
   const rebuilt = buildSeriesForView(currentTimeframe);
-  candleSeries.setData(seriesDataForChart(rebuilt));
+  candleSeries.setData(rebuilt);
   shownData = rebuilt;
   displayLen = rebuilt.length;
   ctRef = null;
@@ -4239,7 +4257,7 @@ function performUndo() {
       applyTimeframe(currentTimeframe);
     } else {
       const rebuilt = buildSeriesForView(currentTimeframe);
-      candleSeries.setData(seriesDataForChart(rebuilt));
+      candleSeries.setData(rebuilt);
       shownData = rebuilt;
       displayLen = rebuilt.length;
       ctRef = null;
