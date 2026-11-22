@@ -607,3 +607,63 @@ input:disabled + .box { opacity: 0.6; }
 }
 .goto-menu button span { color: var(--muted); font-weight: 500; font-variant-numeric: tabular-nums; }
 .goto-menu button:hover { background: rgba(255, 255, 255, 0.07); }
+
+
+/* ----- drawing style templates ----- */
+.tpl-hint { color: #8a8f9d; font-size: 12px; margin: 0 0 10px; line-height: 1.45; }
+.tpl-save-row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+.tpl-save-row .tpl-name-input { flex: 1; }
+.tpl-list { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
+.tpl-row {
+  display: flex; align-items: center; gap: 6px; padding: 6px 8px;
+  background: #1e1e1e; border: 1px solid #3a3a3a; border-radius: 6px;
+}
+.tpl-name { flex: 1; min-width: 0; color: #e6e6e6; font-weight: 600; font-size: 13px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tpl-row .dlg-btn { min-width: 0; padding: 4px 10px; font-size: 12px; }
+.tpl-row .tpl-del { padding: 4px 8px; color: #ff7b86; border-color: #5a3a3a; }
+.tpl-row .tpl-del:hover { border-color: #ff7b86; }
+
+
+/* ----- TradingView-style drawing template menu ----- */
+.tpl-menu {
+  min-width: 240px;
+  max-width: 300px;
+  padding: 6px 0 !important;
+  margin: 0 !important;
+  background: #1e222d !important;
+  border: 1px solid #2a2e39;
+  border-radius: 6px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+}
+.tpl-menu .menu-item {
+  padding: 9px 16px;
+  border-radius: 0;
+  color: #d1d4dc;
+  font-size: 13px;
+  font-weight: 500;
+  width: 100%;
+  text-align: left;
+}
+.tpl-menu .menu-item:hover {
+  background: #2a2e39;
+  color: #fff;
+}
+.tpl-menu .tpl-sep-after {
+  border-bottom: 1px solid #2a2e39;
+  margin-bottom: 2px;
+  padding-bottom: 10px;
+}
+.tpl-menu-list {
+  max-height: 280px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #434651 transparent;
+}
+.tpl-menu-list::-webkit-scrollbar { width: 6px; }
+.tpl-menu-list::-webkit-scrollbar-thumb { background: #434651; border-radius: 3px; }
+.tpl-menu-empty {
+  padding: 10px 16px;
+  color: #787b86;
+  font-size: 12px;
+}

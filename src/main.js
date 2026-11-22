@@ -958,6 +958,59 @@ function rememberStyle(s) {
   toolStyles[s.tool] = clone(o);
 }
 
+// ---------- named drawing templates (style presets per tool) ----------
+const TPL_KEY = 'onyx.drawTemplates.v1';
+let drawTemplates = {}; // { tool: [{ name, style }, ...] }
+function loadDrawTemplates() {
+  try {
+    const o = JSON.parse(localStorage.getItem(TPL_KEY));
+    drawTemplates = (o && typeof o === 'object') ? o : {};
+  } catch (e) { drawTemplates = {}; }
+}
+function saveDrawTemplates() {
+  try { localStorage.setItem(TPL_KEY, JSON.stringify(drawTemplates)); } catch (e) { /* storage unavailable */ }
+}
+loadDrawTemplates();
+function styleSnapshot(s) {
+  if (!s) return {};
+  const o = {};
+  for (const k in s) if (!STYLE_SKIP.has(k)) o[k] = s[k];
+  return clone(o);
+}
+function listTemplates(tool) {
+  const arr = drawTemplates[tool];
+  return Array.isArray(arr) ? arr : [];
+}
+function saveTemplate(tool, name, style) {
+  const n = String(name || '').trim();
+  if (!tool || !n) return false;
+  if (!drawTemplates[tool]) drawTemplates[tool] = [];
+  const list = drawTemplates[tool];
+  const i = list.findIndex(t => t.name.toLowerCase() === n.toLowerCase());
+  const entry = { name: n, style: clone(style) };
+  if (i >= 0) list[i] = entry; else list.push(entry);
+  saveDrawTemplates();
+  return true;
+}
+function deleteTemplate(tool, name) {
+  if (!drawTemplates[tool]) return;
+  drawTemplates[tool] = drawTemplates[tool].filter(t => t.name !== name);
+  if (!drawTemplates[tool].length) delete drawTemplates[tool];
+  saveDrawTemplates();
+}
+function applyTemplate(s, name) {
+  if (!s || !s.tool) return false;
+  const t = listTemplates(s.tool).find(x => x.name === name);
+  if (!t || !t.style) return false;
+  const skip = STYLE_SKIP;
+  for (const k of Object.keys(t.style)) {
+    if (skip.has(k)) continue;
+    s[k] = clone(t.style[k]);
+  }
+  rememberStyle(s);
+  return true;
+}
+
 const clone = (o) => JSON.parse(JSON.stringify(o));
 const findShape = (id) => drawings.find(d => d.id === id);
 function ensureVis(d) {
@@ -1356,7 +1409,9 @@ const ICON = {
   lock: ic('<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018 0v3"/>'),
   unlock: ic('<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 017.6-1.7"/>'),
   trash: ic('<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>'),
-  more: ic('<circle cx="5" cy="12" r="1.3" fill="currentColor"/><circle cx="12" cy="12" r="1.3" fill="currentColor"/><circle cx="19" cy="12" r="1.3" fill="currentColor"/>')
+  more: ic('<circle cx="5" cy="12" r="1.3" fill="currentColor"/><circle cx="12" cy="12" r="1.3" fill="currentColor"/><circle cx="19" cy="12" r="1.3" fill="currentColor"/>'),
+  // TradingView-style templates: 2x2 tiles with + on the last cell
+  template: ic('<rect x="4" y="4" width="7" height="7" rx="1.5"/><rect x="13" y="4" width="7" height="7" rx="1.5"/><rect x="4" y="13" width="7" height="7" rx="1.5"/><rect x="13" y="13" width="7" height="7" rx="1.5"/><path d="M16.5 15.5v4M14.5 17.5h4" stroke-width="1.6"/>')
 };
 
 // ---------- popups (colour / thickness / style / more) ----------
@@ -1483,7 +1538,7 @@ function refreshFloating() {
   const s = findShape(selectedShapeId);
   if (!s) { editToolbar.classList.remove('active'); return; }
   const grip = `<div class="ft-grip" id="ftGrip"><svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor"><circle cx="2" cy="2" r="1"/><circle cx="7" cy="2" r="1"/><circle cx="2" cy="7" r="1"/><circle cx="7" cy="7" r="1"/><circle cx="2" cy="12" r="1"/><circle cx="7" cy="12" r="1"/></svg></div>`;
-  let h = grip;
+  let h = grip + ftBtn('template', ICON.template, null, 'Templates');
   if (s.tool === 'line' || s.tool === 'hline' || s.tool === 'hray' || s.tool === 'vline') {
     h += ftBtn('stroke', ICON.pencil, s.color, 'Line colour') + ftBtn('text', ICON.text, s.textColor, 'Text') + widthStyleBtns(s);
   } else if (s.tool === 'rect') {
@@ -1552,6 +1607,10 @@ ftButtons.addEventListener('click', (e) => {
     });
     return;
   }
+  if (act === 'template') {
+    openTemplateMenu(btn, s);
+    return;
+  }
   if (act === 'more') {
     openChoiceMenu(btn, [
       { value: 'clone', html: '<span>Clone</span>' },
@@ -1565,6 +1624,110 @@ ftButtons.addEventListener('click', (e) => {
     }, 'menu-text');
   }
 });
+
+/** TradingView-style drawing template menu (Save / Apply default / named list). */
+function openTemplateMenu(anchor, s) {
+  if (!s || !s.tool) return;
+  if (popupAnchor === anchor && popup.style.display === 'block') { closePopup(); return; }
+  const esc = (t) => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const tpls = listTemplates(s.tool);
+  const wrap = document.createElement('div');
+  wrap.className = 'menu menu-text tpl-menu';
+
+  const addItem = (label, value, opts = {}) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'menu-item' + (opts.sep ? ' tpl-sep-after' : '') + (opts.muted ? ' tpl-muted' : '');
+    b.innerHTML = '<span>' + esc(label) + '</span>';
+    if (opts.title) b.title = opts.title;
+    b.addEventListener('click', () => {
+      closePopup();
+      if (value === 'save') {
+        const name = prompt('Save drawing template as:', '');
+        if (name && saveTemplate(s.tool, name, styleSnapshot(s))) {
+          try { trToast('Template saved: ' + name.trim()); } catch (e) { /* optional */ }
+        }
+        return;
+      }
+      if (value === 'default') {
+        // Reset style fields to factory defaults for this tool (keep geometry / text content)
+        const base = defaultStyle(s.tool);
+        const skip = STYLE_SKIP;
+        for (const k of Object.keys(base)) {
+          if (skip.has(k)) continue;
+          s[k] = clone(base[k]);
+        }
+        // Clear last-used so next new drawing also uses factory defaults
+        delete toolStyles[s.tool];
+        rememberStyle(s);
+        refreshFloating();
+        syncDialog();
+        dirty = true;
+        return;
+      }
+      if (typeof value === 'string' && value.startsWith('apply:')) {
+        if (applyTemplate(s, value.slice(6))) {
+          refreshFloating();
+          syncDialog();
+          dirty = true;
+        }
+      }
+      if (typeof value === 'string' && value.startsWith('del:')) {
+        deleteTemplate(s.tool, value.slice(4));
+      }
+    });
+    // Right-click a named template to delete it
+    if (typeof value === 'string' && value.startsWith('apply:')) {
+      b.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        const name = value.slice(6);
+        if (confirm('Delete template "' + name + '"?')) {
+          deleteTemplate(s.tool, name);
+          closePopup();
+          openTemplateMenu(anchor, s);
+        }
+      });
+    }
+    wrap.appendChild(b);
+  };
+
+  addItem('Save Drawing Template As...', 'save', { sep: true });
+  addItem('Apply Default Drawing Template', 'default', { sep: true });
+  if (!tpls.length) {
+    const empty = document.createElement('div');
+    empty.className = 'tpl-menu-empty';
+    empty.textContent = 'No saved templates';
+    wrap.appendChild(empty);
+  } else {
+    const list = document.createElement('div');
+    list.className = 'tpl-menu-list';
+    tpls.forEach(t => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'menu-item';
+      b.innerHTML = '<span>' + esc(t.name) + '</span>';
+      b.addEventListener('click', () => {
+        closePopup();
+        if (applyTemplate(s, t.name)) {
+          refreshFloating();
+          syncDialog();
+          dirty = true;
+        }
+      });
+      b.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        if (confirm('Delete template "' + t.name + '"?')) {
+          deleteTemplate(s.tool, t.name);
+          closePopup();
+          openTemplateMenu(anchor, s);
+        }
+      });
+      list.appendChild(b);
+    });
+    wrap.appendChild(list);
+  }
+  openPopup(anchor, wrap);
+}
 
 // Dragging a floating panel by its grip
 function attachDrag(panel, grip) {
@@ -1670,10 +1833,25 @@ function styleTabHTML(s) {
 function inputsTabHTML() {
   return row('Qty', numBox('qty')) + row('Width (bars)', numBox('widthBars')) + row('Entry price', numBox('p1.price')) + row('Profit level (price)', numBox('tpPrice')) + row('Stop level (price)', numBox('slPrice'));
 }
+function templatesTabHTML(s) {
+  const esc = (t) => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const list = listTemplates(s.tool);
+  const rows = list.length
+    ? list.map(t => `<div class="tpl-row" data-tpl="${esc(t.name)}"><span class="tpl-name">${esc(t.name)}</span>
+        <button type="button" class="dlg-btn tpl-apply" data-tpl-act="apply" data-name="${esc(t.name)}">Apply</button>
+        <button type="button" class="dlg-btn tpl-del" data-tpl-act="del" data-name="${esc(t.name)}" title="Delete">✕</button></div>`).join('')
+    : '<div class="ind-empty">No templates saved for this tool yet.</div>';
+  return `<div class="tpl-hint">Save the current style (colour, size, text alignment, Fib levels, etc.) under a name, then re-apply it to any drawing of the same type.</div>
+    <div class="tpl-save-row">
+      <input type="text" class="dlg-num tpl-name-input" id="tplNameInput" placeholder="Template name" style="width:100%;text-align:left">
+      <button type="button" class="dlg-btn primary" data-tpl-act="save">Save</button>
+    </div>
+    <div class="tpl-list">${rows}</div>`;
+}
 function dialogTabs(s) {
-  if (s.tool === 'line' || s.tool === 'hline' || s.tool === 'hray' || s.tool === 'vline' || s.tool === 'rect') return [['style', 'Style'], ['text', 'Text'], ['coords', 'Coordinates'], ['vis', 'Visibility']];
-  if (s.tool === 'fib') return [['style', 'Style'], ['coords', 'Coordinates'], ['vis', 'Visibility']];
-  return [['inputs', 'Inputs'], ['style', 'Style'], ['coords', 'Coordinates'], ['vis', 'Visibility']];
+  if (s.tool === 'line' || s.tool === 'hline' || s.tool === 'hray' || s.tool === 'vline' || s.tool === 'rect') return [['style', 'Style'], ['text', 'Text'], ['coords', 'Coordinates'], ['vis', 'Visibility'], ['templates', 'Templates']];
+  if (s.tool === 'fib') return [['style', 'Style'], ['coords', 'Coordinates'], ['vis', 'Visibility'], ['templates', 'Templates']];
+  return [['inputs', 'Inputs'], ['style', 'Style'], ['coords', 'Coordinates'], ['vis', 'Visibility'], ['templates', 'Templates']];
 }
 function openDialog(s, tab) {
   closePopup();
@@ -1682,7 +1860,8 @@ function openDialog(s, tab) {
   dlgTab = tab && tabs.some(t => t[0] === tab) ? tab : tabs[0][0];
   const panes = {
     style: styleTabHTML(s), text: (s.tool === 'line' || s.tool === 'hline' || s.tool === 'hray' || s.tool === 'vline' || s.tool === 'rect') ? textTabHTML() : '',
-    coords: coordsTabHTML(s), vis: visTabHTML(), inputs: isPosTool(s.tool) ? inputsTabHTML() : ''
+    coords: coordsTabHTML(s), vis: visTabHTML(), inputs: isPosTool(s.tool) ? inputsTabHTML() : '',
+    templates: templatesTabHTML(s)
   };
   dialog.innerHTML = `
     <div class="dlg-head" id="dlgHead"><span>${TOOL_TITLE[s.tool]}</span><button type="button" class="dlg-x" data-dlg="cancel">✕</button></div>
@@ -1738,6 +1917,23 @@ dialog.addEventListener('click', (e) => {
   if (t.dataset.dlg === 'ok') closeDialog(false);
   else if (t.dataset.dlg === 'cancel') closeDialog(true);
   else if (t.dataset.tab) showDlgTab(t.dataset.tab);
+  else if (t.dataset.tplAct && s) {
+    const act = t.dataset.tplAct;
+    if (act === 'save') {
+      const input = dialog.querySelector('#tplNameInput');
+      const name = (input && input.value || '').trim();
+      if (!name) { if (input) input.focus(); return; }
+      saveTemplate(s.tool, name, styleSnapshot(s));
+      const pane = dialog.querySelector('[data-pane="templates"]');
+      if (pane) pane.innerHTML = templatesTabHTML(s);
+    } else if (act === 'apply') {
+      if (applyTemplate(s, t.dataset.name)) { refreshFloating(); syncDialog(); dirty = true; }
+    } else if (act === 'del') {
+      deleteTemplate(s.tool, t.dataset.name);
+      const pane = dialog.querySelector('[data-pane="templates"]');
+      if (pane) pane.innerHTML = templatesTabHTML(s);
+    }
+  }
   else if (t.dataset.tog && s) { s[t.dataset.tog] = !s[t.dataset.tog]; rememberStyle(s); syncDialog(); dirty = true; }
   else if (t.dataset.sw && s) {
     const ck = t.dataset.sw, ok = t.dataset.op;
@@ -2367,6 +2563,8 @@ function render() {
 
   // Indicator boxes (any plot with type: 'box')
   renderIndicatorBoxes(layer, pw);
+  // Volume profile (horizontal volume-at-price bars)
+  renderVolumeProfiles(layer, pw);
 }
 
 function renderIndicatorBoxes(layer, pw) {
@@ -2427,6 +2625,74 @@ function renderIndicatorBoxes(layer, pw) {
             t.textContent = b.label;
             t.style.pointerEvents = 'none';
           }
+        }
+      }
+    }
+  });
+}
+
+function renderVolumeProfiles(layer, pw) {
+  if (!indSeries.size) return;
+  const rightEdge = Math.max(1, pw);
+  indSeries.forEach((rt) => {
+    if (!rt.vp) return;
+    for (const key of Object.keys(rt.vp)) {
+      const vp = rt.vp[key];
+      const data = vp.data;
+      const st = vp.style || {};
+      if (st.on === false || !data || !Array.isArray(data.rows) || !data.rows.length) continue;
+      const maxVol = data.maxVol || 0;
+      if (!(maxVol > 0)) continue;
+      const side = st.side === 'left' ? 'left' : 'right';
+      const widthPct = Math.min(60, Math.max(5, st.widthPct || 30)) / 100;
+      const maxBarW = Math.max(8, rightEdge * widthPct);
+      const baseX = side === 'right' ? rightEdge : 0;
+      const showPoc = st.showPoc !== false;
+      const showVa = st.showVa !== false;
+      const fillOp = st.fillOpacity !== undefined ? st.fillOpacity : 0.55;
+      const upColor = st.color || '#2962ff';
+      const vaColor = st.vaColor || '#089981';
+      const pocColor = st.pocColor || '#f7a600';
+      const g = mk('g', { class: 'vp-layer' }, layer);
+      g.style.pointerEvents = 'none';
+      const vaHigh = data.vaHigh, vaLow = data.vaLow, poc = data.poc;
+      for (const row of data.rows) {
+        if (!row || !(row.vol > 0)) continue;
+        const yTop = candleSeries.priceToCoordinate(row.high);
+        const yBot = candleSeries.priceToCoordinate(row.low);
+        if (yTop === null || yBot === null || !isFinite(yTop) || !isFinite(yBot)) continue;
+        const top = Math.min(yTop, yBot);
+        const h = Math.max(1, Math.abs(yBot - yTop));
+        const w = Math.max(1, (row.vol / maxVol) * maxBarW);
+        const x = side === 'right' ? baseX - w : baseX;
+        const inVa = showVa && isFinite(vaHigh) && isFinite(vaLow) && row.mid <= vaHigh && row.mid >= vaLow;
+        const isPoc = showPoc && isFinite(poc) && Math.abs(row.mid - poc) < (row.high - row.low) * 0.51;
+        const col = isPoc ? pocColor : (inVa ? vaColor : upColor);
+        mk('rect', {
+          x, y: top, width: w, height: h,
+          fill: rgba(col, fillOp),
+          stroke: 'none'
+        }, g);
+      }
+      if (showPoc && isFinite(poc)) {
+        const y = candleSeries.priceToCoordinate(poc);
+        if (y !== null && isFinite(y)) {
+          mk('line', {
+            x1: side === 'right' ? rightEdge - maxBarW : 0,
+            y1: y, x2: side === 'right' ? rightEdge : maxBarW, y2: y,
+            stroke: pocColor, 'stroke-width': 1.5, 'stroke-dasharray': '4 3'
+          }, g);
+        }
+      }
+      if (showVa && isFinite(vaHigh) && isFinite(vaLow)) {
+        for (const pr of [vaHigh, vaLow]) {
+          const y = candleSeries.priceToCoordinate(pr);
+          if (y === null || !isFinite(y)) continue;
+          mk('line', {
+            x1: side === 'right' ? rightEdge - maxBarW : 0,
+            y1: y, x2: side === 'right' ? rightEdge : maxBarW, y2: y,
+            stroke: vaColor, 'stroke-width': 1, 'stroke-dasharray': '2 3', opacity: 0.85
+          }, g);
         }
       }
     }
@@ -2991,6 +3257,85 @@ const BUILTIN_INDICATORS = [
     return { hist: ta.sub(macd, signal), macd, signal };
   }
 });` },
+  { id: 'b-vp', builtin: true, name: 'Volume Profile', code: `indicator({
+  name: 'Volume Profile',
+  overlay: true,
+  inputs: {
+    bars: { type: 'number', value: 120, min: 10, max: 5000, label: 'Lookback bars' },
+    rows: { type: 'number', value: 40, min: 8, max: 200, label: 'Row count' },
+    valueArea: { type: 'number', value: 70, min: 10, max: 100, step: 1, label: 'Value area %' },
+    side: { type: 'select', value: 'right', options: ['right', 'left'], label: 'Side' },
+    widthPct: { type: 'number', value: 28, min: 5, max: 60, label: 'Width % of pane' },
+    showPoc: { type: 'bool', value: true, label: 'Show POC' },
+    showVa: { type: 'bool', value: true, label: 'Show value area' }
+  },
+  plots: {
+    profile: {
+      type: 'vp',
+      title: 'Volume Profile',
+      color: '#2962ff',
+      vaColor: '#089981',
+      pocColor: '#f7a600'
+    }
+  },
+  calculate(d, inputs) {
+    const n = d.length;
+    if (!n) return { profile: { rows: [], maxVol: 0, poc: NaN, vaHigh: NaN, vaLow: NaN } };
+    const look = Math.max(10, Math.min(n, Math.floor(inputs.bars || 120)));
+    const start = n - look;
+    let lo = Infinity, hi = -Infinity;
+    for (let i = start; i < n; i++) {
+      if (d.low[i] < lo) lo = d.low[i];
+      if (d.high[i] > hi) hi = d.high[i];
+    }
+    if (!(hi > lo) || !isFinite(lo) || !isFinite(hi)) {
+      return { profile: { rows: [], maxVol: 0, poc: NaN, vaHigh: NaN, vaLow: NaN } };
+    }
+    const rowCount = Math.max(8, Math.min(200, Math.floor(inputs.rows || 40)));
+    const step = (hi - lo) / rowCount;
+    const vols = new Array(rowCount).fill(0);
+    const hasVol = d.volume.some(v => v > 0);
+    for (let i = start; i < n; i++) {
+      const h = d.high[i], l = d.low[i];
+      const v = hasVol ? (d.volume[i] || 0) : 1;
+      if (!(v > 0) || !(h >= l)) continue;
+      const r0 = Math.max(0, Math.min(rowCount - 1, Math.floor((l - lo) / step)));
+      const r1 = Math.max(0, Math.min(rowCount - 1, Math.floor((Math.min(h, hi) - lo) / step - 1e-12)));
+      const span = Math.max(1, r1 - r0 + 1);
+      const share = v / span;
+      for (let r = r0; r <= r1; r++) vols[r] += share;
+    }
+    let maxVol = 0, pocIdx = 0;
+    for (let r = 0; r < rowCount; r++) {
+      if (vols[r] > maxVol) { maxVol = vols[r]; pocIdx = r; }
+    }
+    const total = vols.reduce((a, b) => a + b, 0);
+    const target = total * Math.min(100, Math.max(10, inputs.valueArea || 70)) / 100;
+    let vaLo = pocIdx, vaHi = pocIdx, acc = vols[pocIdx];
+    while (acc < target && (vaLo > 0 || vaHi < rowCount - 1)) {
+      const up = vaHi < rowCount - 1 ? vols[vaHi + 1] : -1;
+      const dn = vaLo > 0 ? vols[vaLo - 1] : -1;
+      if (up >= dn && up >= 0) { vaHi++; acc += up; }
+      else if (dn >= 0) { vaLo--; acc += dn; }
+      else break;
+    }
+    const rows = [];
+    for (let r = 0; r < rowCount; r++) {
+      const low = lo + r * step;
+      const high = lo + (r + 1) * step;
+      rows.push({ low, high, mid: (low + high) / 2, vol: vols[r] });
+    }
+    return {
+      profile: {
+        rows,
+        maxVol,
+        poc: rows[pocIdx].mid,
+        vaHigh: rows[vaHi].high,
+        vaLow: rows[vaLo].low
+      }
+    };
+  }
+});` },
 
 ];
 const BLANK_INDICATOR = `// Onyx indicator - plain JavaScript.
@@ -3019,14 +3364,16 @@ levels     (optional) horizontal guide lines for pane indicators, e.g. [30, 70]
 inputs     Editable settings. Each one is { type, value, label, min, max, step, options }
              type: 'number' | 'select' | 'bool' | 'text'
            Shorthand also works:  length: 20
-plots      Lines / histograms / boxes to draw.
-             type: 'line' (default) | 'histogram' | 'box'
+plots      Lines / histograms / boxes / volume profiles to draw.
+             type: 'line' (default) | 'histogram' | 'box' | 'vp'
              line/histogram: { title, color, width, lineStyle, colorNeg }
              box: { title, fillColor, fillOpacity, borderColor, borderOpacity, borderWidth, extendRight, showLabel }
+             vp:   { title, color, vaColor, pocColor }  (horizontal volume-at-price bars)
            For box plots, calculate() must return an array of
              { time, high, low, label?, extendRight? } objects (not a number per bar).
+           For vp plots, return { rows:[{low,high,mid,vol}], maxVol, poc, vaHigh, vaLow }.
            Shorthand also works:  avg: '#f7a600'
-calculate(d, inputs, ta)   returns { plotKey: [numbers...] } or for boxes { plotKey: [{time,high,low}] }
+calculate(d, inputs, ta)   returns { plotKey: [numbers...] } or for boxes { plotKey: [{time,high,low}] } or vp object
 
 d       arrays with one value per candle:
         d.time (seconds) d.open d.high d.low d.close d.volume d.hl2 d.hlc3 d.ohlc4 d.length
@@ -3055,12 +3402,14 @@ function normalizeIndicatorDef(def) {
   }
   for (const [k, v] of Object.entries(def.plots || {})) {
     const p = typeof v === 'string' ? { color: v } : { ...(v || {}) };
-    const type = p.type === 'histogram' ? 'histogram' : p.type === 'box' ? 'box' : 'line';
+    const type = p.type === 'histogram' ? 'histogram' : p.type === 'box' ? 'box' : p.type === 'vp' ? 'vp' : 'line';
     out.plots[k] = {
       title: p.title || k,
       type,
       color: p.color || '#2962ff',
       colorNeg: p.colorNeg || '#ef5350',
+      vaColor: p.vaColor || '#089981',
+      pocColor: p.pocColor || '#f7a600',
       width: p.width || 2,
       lineStyle: p.lineStyle || 0,
       fillColor: p.fillColor || p.color || '#2962ff',
@@ -3100,6 +3449,10 @@ function testRunIndicator(def) { // catches mistakes when the code is saved
     const out = def.calculate(buildIndicatorSource(slice), defaultInputs(def), TA);
     if (!out || typeof out !== 'object') return 'calculate() must return an object like { plotKey: [numbers] }.';
     for (const k of Object.keys(def.plots)) {
+      if (def.plots[k].type === 'vp') {
+        if (!out[k] || typeof out[k] !== 'object') return `calculate() must return a volume-profile object for plot "${k}".`;
+        continue;
+      }
       if (!Array.isArray(out[k])) return `calculate() did not return an array for the plot "${k}".`;
       if (def.plots[k].type === 'box') continue; // boxes return [{time,high,low}] of any length
       if (out[k].length !== n) return `The array for plot "${k}" has ${out[k].length} values but there are ${n} candles - return one value per candle (use NaN for "no value").`;
@@ -3117,6 +3470,7 @@ const indSeries = new Map(); // uid -> { series: { plotKey: seriesApi }, first }
 let indActiveKey = '', shownData = [];
 const allIndicatorLib = () => [...BUILTIN_INDICATORS, ...customIndicators];
 function compileLib(entry) {
+  if (!entry || !entry.id || typeof entry.code !== 'string') return;
   try {
     const def = compileIndicatorCode(entry.code);
     entry.name = def.name;
@@ -3135,6 +3489,8 @@ function reconcileInstance(inst, def) { // keep saved values, fill in anything n
       on: o.on !== false,
       color: o.color || p.color,
       colorNeg: o.colorNeg || p.colorNeg,
+      vaColor: o.vaColor || p.vaColor,
+      pocColor: o.pocColor || p.pocColor,
       width: o.width || p.width,
       lineStyle: o.lineStyle !== undefined ? o.lineStyle : p.lineStyle,
       fillColor: o.fillColor || p.fillColor || p.color,
@@ -3187,7 +3543,7 @@ function rebuildIndicators() {
     if (!indicatorActive(inst)) continue;
     const def = indDefs.get(inst.libId).def;
     const paneIdx = def.overlay ? 0 : ++pane;
-    const rt = { series: {}, first: null, boxes: {} };
+    const rt = { series: {}, first: null, boxes: {}, vp: {} };
     for (const [key, p] of Object.entries(def.plots)) {
       const st = inst.plots[key] || {};
       if (st.on === false) continue;
@@ -3210,6 +3566,20 @@ function rebuildIndicators() {
         };
         continue;
       }
+      if (p.type === 'vp') {
+        rt.vp[key] = {
+          data: null,
+          style: {
+            on: true,
+            color: st.color || p.color || '#2962ff',
+            vaColor: st.vaColor || p.vaColor || '#089981',
+            pocColor: st.pocColor || p.pocColor || '#f7a600',
+            fillOpacity: st.fillOpacity !== undefined ? st.fillOpacity : 0.55
+          },
+          def: p
+        };
+        continue;
+      }
       const hist = p.type === 'histogram';
       const opts = hist
         ? { color: st.color, priceLineVisible: false, lastValueVisible: false }
@@ -3219,7 +3589,7 @@ function rebuildIndicators() {
       if (!rt.first) rt.first = s;
     }
     if (rt.first && !def.overlay) def.levels.forEach(v => rt.first.createPriceLine({ price: v, color: '#4a4e5b', lineWidth: 1, lineStyle: 2, axisLabelVisible: false }));
-    if (rt.first || Object.keys(rt.boxes).length) indSeries.set(inst.uid, rt);
+    if (rt.first || Object.keys(rt.boxes).length || Object.keys(rt.vp).length) indSeries.set(inst.uid, rt);
   }
   try { // give the extra panes a sensible height
     const panes = chart.panes(), h = Math.max(90, Math.round(chartContainer.clientHeight * 0.2));
@@ -3233,7 +3603,7 @@ function updateIndicatorData() {
   }
   if (!indSeries.size) return;
 
-  const hasBoxes = [...indSeries.values()].some(rt => rt.boxes && Object.keys(rt.boxes).length);
+  const hasBoxes = [...indSeries.values()].some(rt => (rt.boxes && Object.keys(rt.boxes).length) || (rt.vp && Object.keys(rt.vp).length));
 
   // Box indicators need enough *calendar* history so every past-day range is in the
   // slice. 2500 bars on 1m is ~2 days; the same count on 5m covers ~1 week — that is
@@ -3305,6 +3675,20 @@ function updateIndicatorData() {
         }
         box.pts = boxes;
         box.style = st;
+      }
+    }
+    if (rt.vp) {
+      for (const [key, vp] of Object.entries(rt.vp)) {
+        const raw = out && out[key];
+        const st = Object.assign({}, vp.style || {}, inst.plots[key] || {});
+        st.side = inputs.side === 'left' ? 'left' : 'right';
+        st.widthPct = isFinite(+inputs.widthPct) ? +inputs.widthPct : 30;
+        st.showPoc = inputs.showPoc !== false;
+        st.showVa = inputs.showVa !== false;
+        st.showLabels = inputs.showLabels === true;
+        vp.data = (raw && typeof raw === 'object' && Array.isArray(raw.rows)) ? raw : null;
+        vp.style = st;
+        vp.inputs = inputs;
       }
     }
   });
@@ -3509,6 +3893,9 @@ function renderIndDialog() {
       ctrl = pick(`plots.${k}.fillColor`) + pick(`plots.${k}.borderColor`) +
         `<input type="number" class="dlg-num" data-k="plots.${k}.fillOpacity" min="0" max="1" step="0.01" title="Fill opacity" style="width:58px">` +
         `<input type="number" class="dlg-num" data-k="plots.${k}.borderOpacity" min="0" max="1" step="0.01" title="Border opacity" style="width:58px">`;
+    } else if (p.type === 'vp') {
+      ctrl = pick(`plots.${k}.color`) + pick(`plots.${k}.vaColor`) + pick(`plots.${k}.pocColor`) +
+        `<input type="number" class="dlg-num" data-k="plots.${k}.fillOpacity" min="0" max="1" step="0.05" title="Bar opacity" style="width:58px">`;
     } else {
       ctrl = pick(`plots.${k}.color`) + selBox(`plots.${k}.width`, [[1, '1px'], [2, '2px'], [3, '3px'], [4, '4px']], true) + selBox(`plots.${k}.lineStyle`, [[0, 'Solid'], [2, 'Dashed'], [1, 'Dotted']], true);
     }
