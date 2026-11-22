@@ -414,7 +414,7 @@ input:disabled + .box { opacity: 0.6; }
   padding: 0;
   border-radius: 4px;
   border: 1px solid #363a45;
-  background: #1e222d;
+  background: transparent;
   color: #d1d4dc;
   font-size: 11px;
   font-weight: 700;
@@ -425,10 +425,19 @@ input:disabled + .box { opacity: 0.6; }
   place-items: center;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
+/* Filled dark background only while the price scale is in auto mode */
+#priceResetBtn.is-auto {
+  background: #1e222d;
+}
+#priceResetBtn.is-manual {
+  background: transparent;
+  opacity: 0.85;
+}
 #priceResetBtn:hover {
   background: #2962ff;
   border-color: #2962ff;
   color: #fff;
+  opacity: 1;
 }
 
 /* ----- jump to current candle (right edge) ----- */
@@ -667,3 +676,25 @@ input:disabled + .box { opacity: 0.6; }
   color: #787b86;
   font-size: 12px;
 }
+
+
+/* ----- anchored note inline editor ----- */
+.note-inline-edit {
+  position: absolute;
+  z-index: 20;
+  resize: both;
+  min-width: 100px;
+  min-height: 32px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid #363a45;
+  outline: none;
+  font-family: inherit;
+  font-weight: 500;
+  line-height: 1.25;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+  overflow: auto;
+}
+
+/* keep + above chart but crosshair still updated via JS */
+#trPlus { z-index: 12; }

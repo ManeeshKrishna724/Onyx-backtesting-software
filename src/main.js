@@ -473,6 +473,19 @@ function buildSeriesForView(tf, fullSeries = null) {
   return visible;
 }
 
+/** During replay, append whitespace (time-only) bars after the cursor so the
+ *  time axis still shows dates/times of candles that have not formed yet. */
+function seriesDataForChart(displayData) {
+  if (replayTimestamp == null || !currentDataCache.length) return displayData;
+  const lastT = displayData.length ? getComparableTime(displayData[displayData.length - 1].time) : null;
+  const out = displayData.slice();
+  for (let i = 0; i < currentDataCache.length; i++) {
+    const t = getComparableTime(currentDataCache[i].time);
+    if (lastT == null || t > lastT) out.push({ time: currentDataCache[i].time });
+  }
+  return out;
+}
+
 function getComparableTime(timeVal) {
   if (timeVal == null) return null;
   if (typeof timeVal === 'number' && isFinite(timeVal)) return timeVal;
@@ -520,12 +533,14 @@ function capturePriceScaleState() {
 function markPriceScaleManual() {
   priceScaleManual = true;
   capturePriceScaleState();
+  try { positionPriceResetBtn(); } catch (e) { /* not ready */ }
 }
 function resetPriceScale() {
   try { chart.priceScale('right').applyOptions({ autoScale: true }); } catch (e) { /* ignore */ }
   priceScaleManual = false;
   savedManualPriceRange = null;
   dirty = true;
+  try { positionPriceResetBtn(); } catch (e) { /* not ready */ }
 }
 
 function binaryCutoffIndex(data, ts) {
@@ -578,7 +593,7 @@ function applyTimeframe(tf, skipZoom = false, preserveView = false) {
   const displayData = buildSeriesForView(tf, currentDataCache);
   replayRawIndex = replayTimestamp == null ? -1 : rawIndexAtOrBefore(replayTimestamp);
 
-  candleSeries.setData(displayData);
+  candleSeries.setData(seriesDataForChart(displayData));
   displayLen = displayData.length;
   shownData = displayData;
   window._dataStartIdx = 0;
@@ -752,58 +767,20 @@ function stepReplay(steps) {
   }
   if (targetIdx === cur) return;
 
-  // Backward stepping rebuilds the visible aggregate safely.
-  if (targetIdx < cur) {
-    replayRawIndex = targetIdx;
-    replayTimestamp = getComparableTime(rawCandles[targetIdx].time) + 59;
-    const rebuilt = buildSeriesForView(currentTimeframe);
-    candleSeries.setData(rebuilt);
-    shownData = rebuilt;
-    displayLen = rebuilt.length;
-    ctRef = null;
-  } else {
-    for (let i = cur + 1; i <= targetIdx; i++) {
-      const raw = rawCandles[i];
-      const rawTime = getComparableTime(raw.time);
-      let next;
-
-      if (isOneMinute) {
-        next = { time: rawTime, open: raw.open, high: raw.high, low: raw.low, close: raw.close, volume: raw.volume || 0 };
-      } else {
-        const bucketTime = getSessionAlignedKey(rawTime, currentTimeframe);
-        const last = shownData[shownData.length - 1];
-        const lastTime = last ? getComparableTime(last.time) : null;
-        if (last && lastTime === getComparableTime(bucketTime)) {
-          // Same higher-timeframe candle: mutate only the current partial bar.
-          last.high = Math.max(last.high, raw.high);
-          last.low = Math.min(last.low, raw.low);
-          last.close = raw.close;
-          last.volume = (last.volume || 0) + (raw.volume || 0);
-          next = last;
-        } else {
-          next = { time: bucketTime, open: raw.open, high: raw.high, low: raw.low, close: raw.close, volume: raw.volume || 0 };
-          shownData.push(next);
-          displayLen = shownData.length;
-        }
-      }
-
-      if (isOneMinute) {
-        shownData.push(next);
-        displayLen = shownData.length;
-        candleSeries.update(next);
-      } else {
-        // update() replaces the final bar when its time matches, or appends a new bar.
-        candleSeries.update(next);
-      }
-    }
-    if (!isOneMinute) {
-      // Higher-timeframe data was updated in place; no setData() / full history copy.
-      displayLen = shownData.length;
-    }
-  }
-
+  // Rebuild from the raw cursor. Using setData (instead of incremental update)
+  // keeps whitespace future bars on the time axis in sync and avoids skip buttons
+  // stalling when the series already contains time-only placeholders.
   replayRawIndex = targetIdx;
   replayTimestamp = getComparableTime(rawCandles[targetIdx].time) + 59;
+  const rebuilt = buildSeriesForView(currentTimeframe);
+  try {
+    candleSeries.setData(seriesDataForChart(rebuilt));
+  } catch (e) {
+    try { candleSeries.setData(rebuilt); } catch (e2) { /* ignore */ }
+  }
+  shownData = rebuilt;
+  displayLen = rebuilt.length;
+  ctRef = null;
   updateStatusBar(shownData);
   dirty = true;
   scheduleIndicatorSync(80);
@@ -884,7 +861,7 @@ function goToSession(sessionKey) {
   if (selBtn) selBtn.classList.remove('active');
   chartContainer.style.cursor = 'default';
   const rebuilt = buildSeriesForView(currentTimeframe);
-  candleSeries.setData(rebuilt);
+  candleSeries.setData(seriesDataForChart(rebuilt));
   shownData = rebuilt;
   displayLen = rebuilt.length;
   ctRef = null;
@@ -950,11 +927,16 @@ let dragState = null;
 let creating = null;
 let posSize = null; // last-used long/short box size: { tp, sl (points), bars (width) }
 let toolStyles = {}; // last-used style per tool, applied to the next drawing of that tool
-const STYLE_SKIP = new Set(['id', 'tool', 'p1', 'p2', 'tpPrice', 'slPrice', 'locked', 'isPreview', 'text', 'vis', 'widthBars']);
+const STYLE_SKIP = new Set(['id', 'tool', 'p1', 'p2', 'tpPrice', 'slPrice', 'locked', 'isPreview', 'vis', 'widthBars']);
 function rememberStyle(s) {
   if (!s || !s.tool) return;
   const o = {};
-  for (const k in s) if (!STYLE_SKIP.has(k)) o[k] = s[k];
+  // Remember colours, sizes, alignment, etc. — but never the text content of the last drawing.
+  // (Named templates can still store text via styleSnapshot.)
+  for (const k in s) {
+    if (STYLE_SKIP.has(k) || k === 'text') continue;
+    o[k] = s[k];
+  }
   toolStyles[s.tool] = clone(o);
 }
 
@@ -1253,6 +1235,15 @@ function defaultStyle(tool) {
     width: 1, lineStyle: 'solid', trend: true, trendColor: '#787b86', trendStyle: 'dashed', extend: 'none',
     oneColor: false, oneColorValue: '#787b86', bg: true, bgOpacity: 0.2, levels: clone(FIB_DEFAULTS)
   };
+  if (tool === 'note') return {
+    text: 'Note',
+    textColor: '#ffffff', textOpacity: 1, textSize: 13, bold: false, italic: false,
+    textV: 'middle', textH: 'left',
+    bgColor: '#1e222d', bgOpacity: 0.95,
+    borderColor: '#363a45', borderOpacity: 1, width: 1,
+    anchorColor: '#e91e8c', anchorOpacity: 1,
+    lineColor: '#e91e8c', lineOpacity: 1, lineWidth: 1.2
+  };
   return {
     profitColor: '#089981', profitOpacity: 0.2, stopColor: '#f23645', stopOpacity: 0.2,
     textColor: '#ffffff', textOpacity: 1, lineColor: '#787b86', qty: 1
@@ -1261,7 +1252,10 @@ function defaultStyle(tool) {
 const isAxisTool = (t) => t === 'hline' || t === 'hray' || t === 'vline';
 const isOneClickTool = (t) => isPosTool(t) || isAxisTool(t);
 function makeShape(tool, p1, p2) {
-  const s = { id: nextShapeId++, tool, p1, p2, locked: false, ...defaultStyle(tool), ...clone(toolStyles[tool] || {}) };
+  const base = defaultStyle(tool);
+  const remembered = clone(toolStyles[tool] || {});
+  delete remembered.text; // never inherit previous drawing's text content
+  const s = { id: nextShapeId++, tool, p1, p2, locked: false, ...base, ...remembered, text: base.text || '' };
   // Always default to visible on every timeframe unless the user later customizes this shape
   s.vis = { min: true, hour: true, day: true, week: true };
   if (isPosTool(tool)) {
@@ -1548,6 +1542,9 @@ function refreshFloating() {
     const first = s.levels.find(l => l.on);
     h += ftBtn('stroke', ICON.pencil, s.oneColor ? s.oneColorValue : (first ? first.color : '#787b86'), 'Line colour') +
       `<button type="button" class="ft-btn ft-wide" data-act="width" title="Line thickness"><span class="ft-sample" style="border-top:${Math.min(s.width, 4)}px solid #d1d4dc"></span><span class="ft-txt">${s.width}px</span></button>`;
+  } else if (s.tool === 'note') {
+    h += ftBtn('fill', ICON.bucket, s.bgColor, 'Background') + ftBtn('text', ICON.text, s.textColor, 'Text') +
+      ftBtn('stroke', ICON.pencil, s.anchorColor, 'Anchor colour');
   } else {
     h += ftBtn('textcolor', ICON.text, s.textColor, 'Text colour') + ftBtn('profit', ICON.bucket, s.profitColor, 'Profit colour') +
       ftBtn('stop', ICON.bucket, s.stopColor, 'Stop colour');
@@ -1569,6 +1566,7 @@ function cloneShape(s) {
 function colourTarget(s, act) {
   if (s.tool === 'line' || s.tool === 'hline' || s.tool === 'hray' || s.tool === 'vline') return act === 'stroke' ? ['color', 'opacity'] : ['textColor', 'textOpacity'];
   if (s.tool === 'rect') return act === 'stroke' ? ['borderColor', 'borderOpacity'] : act === 'fill' ? ['bgColor', 'bgOpacity'] : ['textColor', 'textOpacity'];
+  if (s.tool === 'note') return act === 'fill' ? ['bgColor', 'bgOpacity'] : act === 'stroke' ? ['anchorColor', 'anchorOpacity'] : ['textColor', 'textOpacity'];
   if (isPosTool(s.tool)) return act === 'profit' ? ['profitColor', 'profitOpacity'] : act === 'stop' ? ['stopColor', 'stopOpacity'] : ['textColor', 'textOpacity'];
   return null;
 }
@@ -1578,7 +1576,7 @@ ftButtons.addEventListener('click', (e) => {
   if (!btn || !s) return;
   const act = btn.dataset.act;
   if (act === 'settings') { closePopup(); openDialog(s, null); return; }
-  if (act === 'text' && (s.tool === 'line' || s.tool === 'hline' || s.tool === 'hray' || s.tool === 'vline' || s.tool === 'rect')) { closePopup(); openDialog(s, 'text'); return; }
+  if (act === 'text' && (s.tool === 'line' || s.tool === 'hline' || s.tool === 'hray' || s.tool === 'vline' || s.tool === 'rect' || s.tool === 'note')) { closePopup(); openDialog(s, 'text'); return; }
   if (act === 'delete') { pushUndo('delete drawing'); closePopup(); drawings = drawings.filter(d => d.id !== s.id); deselect(); return; }
   if (act === 'lock') { s.locked = !s.locked; refreshFloating(); dirty = true; return; }
   if (act === 'stroke' && s.tool === 'fib') {
@@ -1777,7 +1775,7 @@ const dialog = document.createElement('div');
 dialog.className = 'dt-dialog';
 document.body.appendChild(dialog);
 let dlgShapeId = null, dlgSnapshot = null, dlgPrevStyles = null, dlgPrevPos = null, dlgTab = 'style';
-const TOOL_TITLE = { line: 'Trend line', hline: 'Horizontal line', hray: 'Horizontal ray', vline: 'Vertical line', rect: 'Rectangle', fib: 'Fib retracement', long: 'Long position', short: 'Short position' };
+const TOOL_TITLE = { line: 'Trend line', hline: 'Horizontal line', hray: 'Horizontal ray', vline: 'Vertical line', rect: 'Rectangle', fib: 'Fib retracement', long: 'Long position', short: 'Short position', note: 'Anchored note' };
 const row = (label, inner) => `<div class="dlg-row"><div class="dlg-label">${label}</div><div class="dlg-ctrl">${inner}</div></div>`;
 const chkRow = (path, label, inner = '') => `<div class="dlg-row"><label class="dlg-chk"><input type="checkbox" data-k="${path}"><span class="box"></span><span>${label}</span></label><div class="dlg-ctrl">${inner}</div></div>`;
 const swBtn = (c, o) => `<button type="button" class="dlg-sw" data-sw="${c}" ${o ? `data-op="${o}"` : ''}><i></i></button>`;
@@ -1828,6 +1826,12 @@ function styleTabHTML(s) {
       chkRow('oneColor', 'Use one color', swBtn('oneColorValue')) +
       chkRow('bg', 'Background', `<input type="range" min="0" max="1" step="0.05" class="dlg-range" data-k="bgOpacity">`);
   }
+  if (s.tool === 'note') {
+    return row('Background', swBtn('bgColor', 'bgOpacity')) +
+      row('Border', swBtn('borderColor', 'borderOpacity')) +
+      row('Anchor', swBtn('anchorColor', 'anchorOpacity')) +
+      row('Leader line', swBtn('lineColor', 'lineOpacity'));
+  }
   return row('Profit', swBtn('profitColor', 'profitOpacity')) + row('Stop', swBtn('stopColor', 'stopOpacity')) + row('Text', swBtn('textColor', 'textOpacity'));
 }
 function inputsTabHTML() {
@@ -1850,6 +1854,7 @@ function templatesTabHTML(s) {
 }
 function dialogTabs(s) {
   if (s.tool === 'line' || s.tool === 'hline' || s.tool === 'hray' || s.tool === 'vline' || s.tool === 'rect') return [['style', 'Style'], ['text', 'Text'], ['coords', 'Coordinates'], ['vis', 'Visibility'], ['templates', 'Templates']];
+  if (s.tool === 'note') return [['style', 'Style'], ['text', 'Text'], ['coords', 'Coordinates'], ['vis', 'Visibility'], ['templates', 'Templates']];
   if (s.tool === 'fib') return [['style', 'Style'], ['coords', 'Coordinates'], ['vis', 'Visibility'], ['templates', 'Templates']];
   return [['inputs', 'Inputs'], ['style', 'Style'], ['coords', 'Coordinates'], ['vis', 'Visibility'], ['templates', 'Templates']];
 }
@@ -1859,7 +1864,7 @@ function openDialog(s, tab) {
   const tabs = dialogTabs(s);
   dlgTab = tab && tabs.some(t => t[0] === tab) ? tab : tabs[0][0];
   const panes = {
-    style: styleTabHTML(s), text: (s.tool === 'line' || s.tool === 'hline' || s.tool === 'hray' || s.tool === 'vline' || s.tool === 'rect') ? textTabHTML() : '',
+    style: styleTabHTML(s), text: (s.tool === 'line' || s.tool === 'hline' || s.tool === 'hray' || s.tool === 'vline' || s.tool === 'rect' || s.tool === 'note') ? textTabHTML() : '',
     coords: coordsTabHTML(s), vis: visTabHTML(), inputs: isPosTool(s.tool) ? inputsTabHTML() : '',
     templates: templatesTabHTML(s)
   };
@@ -1886,6 +1891,9 @@ function closeDialog(cancel) {
     if (dlgPrevStyles) toolStyles = dlgPrevStyles;
     posSize = dlgPrevPos;
     refreshFloating();
+  } else if (!cancel && dlgShapeId != null) {
+    const s = findShape(dlgShapeId);
+    if (s) rememberStyle(s);
   }
   dialog.style.display = 'none'; dialog.innerHTML = ''; dlgShapeId = null; dlgSnapshot = null; closePopup(); dirty = true;
 }
@@ -2062,6 +2070,7 @@ document.addEventListener('keyup', (e) => { if (e.key === 'Shift') { isShiftDown
 function finishShape(s) {
   pushUndo('draw ' + (s.tool || 'shape'));
   if (isPosTool(s.tool)) rememberPosSize(s);
+  rememberStyle(s); // carry colours / note text / sizes into the next drawing of this tool
   drawings.push(s);
   stopTool();
   selectShape(s.id);
@@ -2117,8 +2126,78 @@ svgOverlay.addEventListener('click', (e) => e.stopPropagation());
 svgOverlay.addEventListener('dblclick', (e) => {
   const sid = parseInt(e.target.getAttribute('data-sid'), 10);
   const s = sid ? findShape(sid) : null;
-  if (s) openDialog(s, null);
+  if (!s) return;
+  if (s.tool === 'note') { startNoteInlineEdit(s); return; }
+  openDialog(s, null);
 });
+
+// Click note body to edit text when already selected and the pointer did not drag
+svgOverlay.addEventListener('click', (e) => {
+  if (!e.target.getAttribute('data-note-edit')) return;
+  const sid = parseInt(e.target.getAttribute('data-note-edit'), 10);
+  const s = findShape(sid);
+  if (!s || s.tool !== 'note' || selectedShapeId !== sid) return;
+  // If a drag just finished, dragState was cleared on mouseup — use a short move threshold flag
+  if (window._noteDidDrag) { window._noteDidDrag = false; return; }
+  e.stopPropagation();
+  startNoteInlineEdit(s);
+});
+
+let noteEditEl = null;
+function endNoteInlineEdit(commit) {
+  if (!noteEditEl) return;
+  const sid = +noteEditEl.dataset.sid;
+  const s = findShape(sid);
+  if (commit && s) {
+    s.text = noteEditEl.value;
+    rememberStyle(s);
+    dirty = true;
+    refreshFloating();
+  }
+  noteEditEl.remove();
+  noteEditEl = null;
+}
+function startNoteInlineEdit(s) {
+  if (!s || s.tool !== 'note' || s.locked) return;
+  endNoteInlineEdit(false);
+  selectShape(s.id);
+  const a = dataToPx(s.p1), b = dataToPx(s.p2);
+  if (!b) return;
+  const lines = String(s.text || '').split('\n');
+  const size = s.textSize || 13;
+  const padX = 10, padY = 8, lineH = size * 1.25;
+  let maxW = 80;
+  for (const ln of lines) maxW = Math.max(maxW, estimateTextWidth(ln || ' ', size));
+  const boxW = Math.max(120, maxW + padX * 2 + 20);
+  const boxH = Math.max(36, Math.max(lines.length, 2) * lineH + padY * 2);
+  const left = b.x - boxW / 2;
+  const top = b.y - boxH / 2;
+  const ta = document.createElement('textarea');
+  ta.className = 'note-inline-edit';
+  ta.dataset.sid = s.id;
+  ta.value = s.text || '';
+  ta.style.left = Math.max(0, left) + 'px';
+  ta.style.top = Math.max(0, top) + 'px';
+  ta.style.width = boxW + 'px';
+  ta.style.height = boxH + 'px';
+  ta.style.fontSize = size + 'px';
+  ta.style.color = s.textColor || '#fff';
+  ta.style.background = rgba(s.bgColor || '#1e222d', s.bgOpacity != null ? s.bgOpacity : 0.95);
+  ta.style.borderColor = rgba(s.borderColor || '#363a45', 1);
+  chartContainer.appendChild(ta);
+  noteEditEl = ta;
+  ta.focus();
+  ta.select();
+  const commit = () => endNoteInlineEdit(true);
+  ta.addEventListener('blur', commit);
+  ta.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') { ev.preventDefault(); endNoteInlineEdit(false); dirty = true; }
+    if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); commit(); }
+    ev.stopPropagation();
+  });
+  ta.addEventListener('mousedown', (ev) => ev.stopPropagation());
+  ta.addEventListener('click', (ev) => ev.stopPropagation());
+}
 
 function moveShape(s, orig, dx, dy) {
   const ts = chart.timeScale();
@@ -2151,7 +2230,7 @@ function setHandle(s, h, time, price) {
   } else if (s.tool === 'vline') {
     s.p1 = { time, price: s.p1.price };
     s.p2 = { time, price: s.p2.price };
-  } else if (s.tool === 'line' || s.tool === 'fib') {
+  } else if (s.tool === 'line' || s.tool === 'fib' || s.tool === 'note') {
     if (h === 'p1' || h === 'p2') {
       let pr = price;
       if (isShiftDown && s.tool === 'line') pr = (h === 'p2' ? s.p1.price : s.p2.price);
@@ -2187,6 +2266,10 @@ document.addEventListener('mousemove', (e) => {
   if (dragState) {
     const s = findShape(dragState.sid);
     if (!s) return;
+    if (Math.abs(e.clientX - dragState.sx) > 3 || Math.abs(e.clientY - dragState.sy) > 3) {
+      dragState.moved = true;
+      if (s.tool === 'note') window._noteDidDrag = true;
+    }
     if (dragState.h) {
       const pt = pxToData(e.clientX - r.left, e.clientY - r.top);
       if (pt) setHandle(s, dragState.h, pt.time, pt.price);
@@ -2256,22 +2339,61 @@ function hit(el, s, strokeOnly) {
   return el;
 }
 
+function estimateTextWidth(str, size) {
+  const lines = String(str || '').split('\n');
+  let max = 0;
+  for (const ln of lines) max = Math.max(max, ln.length);
+  return max * (size || 12) * 0.62;
+}
+function strokeLineAttrs(s) {
+  return {
+    stroke: rgba(s.color, s.opacity), 'stroke-width': s.width,
+    'stroke-dasharray': dashOf(s.lineStyle) || null,
+    'stroke-linecap': s.lineStyle === 'dotted' ? 'round' : 'butt'
+  };
+}
 function renderLine(s, g, c, pw) {
   const dx = c.x2 - c.x1, dy = c.y2 - c.y1, len = Math.hypot(dx, dy) || 1, ux = dx / len, uy = dy / len;
   let ax1 = c.x1, ay1 = c.y1, ax2 = c.x2, ay2 = c.y2;
   if (s.extendLeft) { ax1 = c.x1 - ux * 1e5; ay1 = c.y1 - uy * 1e5; }
   if (s.extendRight) { ax2 = c.x2 + ux * 1e5; ay2 = c.y2 + uy * 1e5; }
-  mk('line', { x1: ax1, y1: ay1, x2: ax2, y2: ay2, stroke: rgba(s.color, s.opacity), 'stroke-width': s.width, 'stroke-dasharray': dashOf(s.lineStyle) || null, 'stroke-linecap': s.lineStyle === 'dotted' ? 'round' : 'butt' }, g);
+  const [lx, ly, rx, ry] = c.x1 <= c.x2 ? [c.x1, c.y1, c.x2, c.y2] : [c.x2, c.y2, c.x1, c.y1];
+  const ang = Math.atan2(ry - ly, rx - lx) * 180 / Math.PI;
+  const px = s.textH === 'left' ? lx : s.textH === 'right' ? rx : (lx + rx) / 2;
+  const py = s.textH === 'left' ? ly : s.textH === 'right' ? ry : (ly + ry) / 2;
+  const hasText = !!(s.text && String(s.text).trim());
+  // Vertical middle: open a gap under the label so the stroke never strikes through the text
+  const middleV = hasText && s.textV === 'middle';
+  const sa = strokeLineAttrs(s);
+  if (middleV) {
+    const tw = estimateTextWidth(s.text, s.textSize) + 12;
+    let gapBefore, gapAfter;
+    if (s.textH === 'left') { gapBefore = 4; gapAfter = tw + 4; }
+    else if (s.textH === 'right') { gapBefore = tw + 4; gapAfter = 4; }
+    else { gapBefore = tw / 2; gapAfter = tw / 2; }
+    // Distance of text anchor from the drawn start, projected onto the unit direction
+    const fullLen = Math.hypot(ax2 - ax1, ay2 - ay1) || 1;
+    const tDist = (px - ax1) * ux + (py - ay1) * uy;
+    const g0 = Math.max(0, Math.min(fullLen, tDist - gapBefore));
+    const g1 = Math.max(0, Math.min(fullLen, tDist + gapAfter));
+    // First segment: start → gap (skip if too short so we never draw a stub past the end)
+    if (g0 > 0.5) {
+      mk('line', { x1: ax1, y1: ay1, x2: ax1 + ux * g0, y2: ay1 + uy * g0, ...sa }, g);
+    }
+    // Second segment: gap end → end
+    if (g1 < fullLen - 0.5) {
+      mk('line', { x1: ax1 + ux * g1, y1: ay1 + uy * g1, x2: ax2, y2: ay2, ...sa }, g);
+    }
+  } else {
+    mk('line', { x1: ax1, y1: ay1, x2: ax2, y2: ay2, ...sa }, g);
+  }
   if (!s.isPreview) hit(mk('line', { x1: ax1, y1: ay1, x2: ax2, y2: ay2, stroke: 'transparent', 'stroke-width': 12 }, g), s);
-  if (s.text) {
-    const [lx, ly, rx, ry] = c.x1 <= c.x2 ? [c.x1, c.y1, c.x2, c.y2] : [c.x2, c.y2, c.x1, c.y1];
-    const ang = Math.atan2(ry - ly, rx - lx) * 180 / Math.PI;
-    const px = s.textH === 'left' ? lx : s.textH === 'right' ? rx : (lx + rx) / 2;
-    const py = s.textH === 'left' ? ly : s.textH === 'right' ? ry : (ly + ry) / 2;
-    const off = s.textV === 'top' ? -8 : s.textV === 'bottom' ? s.textSize + 4 : s.textSize * 0.35;
-    addText(g, s.text.split('\n'), px, py + off, s.textH === 'left' ? 'start' : s.textH === 'right' ? 'end' : 'middle', s, `rotate(${ang} ${px} ${py})`);
+  if (hasText) {
+    const off = s.textV === 'top' ? -8 : s.textV === 'bottom' ? (s.textSize || 12) + 4 : (s.textSize || 12) * 0.35;
+    addText(g, String(s.text).split('\n'), px, py + off, s.textH === 'left' ? 'start' : s.textH === 'right' ? 'end' : 'middle', s, `rotate(${ang} ${px} ${py})`);
   }
 }
+
 function renderHLine(s, g, c, pw) {
   const y = c.y1;
   let x1 = -5, x2 = pw + 5;
@@ -2280,12 +2402,35 @@ function renderHLine(s, g, c, pw) {
     x1 = c.x1;
     x2 = pw + 5;
   }
-  mk('line', { x1, y1: y, x2, y2: y, stroke: rgba(s.color, s.opacity), 'stroke-width': s.width, 'stroke-dasharray': dashOf(s.lineStyle) || null, 'stroke-linecap': s.lineStyle === 'dotted' ? 'round' : 'butt' }, g);
+  const hasText = !!(s.text && String(s.text).trim());
+  const sa = strokeLineAttrs(s);
+  // Horizontal position of the label
+  let px;
+  if (s.tool === 'hray') px = x1 + 8;
+  else if (s.textH === 'left') px = Math.max(8, x1 + 8);
+  else if (s.textH === 'right') px = Math.min(pw - 8, x2 - 8);
+  else px = (Math.max(0, x1) + Math.min(pw, x2)) / 2;
+  // Gap under label whenever vertical alignment is middle
+  const middleV = hasText && s.textV === 'middle';
+  if (middleV) {
+    const tw = estimateTextWidth(s.text, s.textSize) + 12;
+    let gapBefore, gapAfter;
+    if (s.tool === 'hray' || s.textH === 'left') { gapBefore = 4; gapAfter = tw + 4; }
+    else if (s.textH === 'right') { gapBefore = tw + 4; gapAfter = 4; }
+    else { gapBefore = tw / 2; gapAfter = tw / 2; }
+    const leftEnd = Math.min(x1, x2), rightEnd = Math.max(x1, x2);
+    const g0 = Math.max(leftEnd, px - gapBefore);
+    const g1 = Math.min(rightEnd, px + gapAfter);
+    if (g0 > leftEnd + 0.5) mk('line', { x1: leftEnd, y1: y, x2: g0, y2: y, ...sa }, g);
+    if (g1 < rightEnd - 0.5) mk('line', { x1: g1, y1: y, x2: rightEnd, y2: y, ...sa }, g);
+  } else {
+    mk('line', { x1, y1: y, x2, y2: y, ...sa }, g);
+  }
   if (!s.isPreview) hit(mk('line', { x1, y1: y, x2, y2: y, stroke: 'transparent', 'stroke-width': 12 }, g), s);
-  if (s.text) {
-    const px = s.tool === 'hray' ? x1 + 8 : (x1 + x2) / 2;
-    const off = s.textV === 'top' ? -8 : s.textV === 'bottom' ? s.textSize + 4 : s.textSize * 0.35;
-    addText(g, s.text.split('\n'), px, y + off, s.tool === 'hray' ? 'start' : 'middle', s);
+  if (hasText) {
+    const off = s.textV === 'top' ? -8 : s.textV === 'bottom' ? (s.textSize || 12) + 4 : (s.textSize || 12) * 0.35;
+    const anchor = s.tool === 'hray' ? 'start' : (s.textH === 'left' ? 'start' : s.textH === 'right' ? 'end' : 'middle');
+    addText(g, String(s.text).split('\n'), px, y + off, anchor, s);
   }
 }
 function renderVLine(s, g, c, pw, ph) {
@@ -2454,7 +2599,7 @@ function renderPosition(s, g, c, selected) {
 function getHandles(s, c, pos) {
   if (s.tool === 'hline' || s.tool === 'hray') return [{ id: 'p1', x: s.tool === 'hray' ? c.x1 : (c.x1 + c.x2) / 2, y: c.y1, cur: 'ns-resize' }];
   if (s.tool === 'vline') return [{ id: 'p1', x: c.x1, y: (c.y1 + c.y2) / 2, cur: 'ew-resize' }];
-  if (s.tool === 'line' || s.tool === 'fib') return [{ id: 'p1', x: c.x1, y: c.y1, cur: 'pointer' }, { id: 'p2', x: c.x2, y: c.y2, cur: 'pointer' }];
+  if (s.tool === 'line' || s.tool === 'fib' || s.tool === 'note') return [{ id: 'p1', x: c.x1, y: c.y1, cur: 'pointer' }, { id: 'p2', x: c.x2, y: c.y2, cur: 'pointer' }];
   if (s.tool === 'rect') {
     const L = Math.min(c.x1, c.x2), R = Math.max(c.x1, c.x2), T = Math.min(c.y1, c.y2), B = Math.max(c.y1, c.y2), mx = (L + R) / 2, my = (T + B) / 2;
     return [
@@ -2496,6 +2641,59 @@ function renderAxisHighlight(s, c, pw, ph, W, H) {
     const t = mk('text', { x: m.x, y: ty + tsH / 2 + 4, 'text-anchor': 'middle', 'font-size': 11, 'font-family': UI_FONT, fill: '#fff' }, svgOverlay);
     t.textContent = label; t.style.pointerEvents = 'none';
   });
+}
+
+function renderNote(s, g, c) {
+  const ax = c.x1, ay = c.y1, bx = c.x2, by = c.y2;
+  const lines = String(s.text || 'Note').split('\n');
+  const size = s.textSize || 13;
+  const padX = 10, padY = 8, lineH = size * 1.25;
+  let maxW = 40;
+  for (const ln of lines) maxW = Math.max(maxW, estimateTextWidth(ln, size));
+  const boxW = Math.max(48, maxW + padX * 2);
+  const boxH = Math.max(28, lines.length * lineH + padY * 2);
+  // Box is centered on p2
+  const left = bx - boxW / 2;
+  const top = by - boxH / 2;
+  const cx = left + boxW / 2, cy = top + boxH / 2;
+  // Leader attaches to the CENTER of the side that faces the anchor
+  let tx, ty;
+  const dx = ax - cx, dy = ay - cy;
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    // Left or right side — horizontal center of that edge is (edge, cy)
+    tx = dx < 0 ? left : left + boxW;
+    ty = cy;
+  } else {
+    // Top or bottom side — vertical center of that edge is (cx, edge)
+    tx = cx;
+    ty = dy < 0 ? top : top + boxH;
+  }
+  mk('line', {
+    x1: ax, y1: ay, x2: tx, y2: ty,
+    stroke: rgba(s.lineColor || s.anchorColor || '#e91e8c', s.lineOpacity != null ? s.lineOpacity : 1),
+    'stroke-width': s.lineWidth || 1.2
+  }, g);
+  mk('circle', {
+    cx: ax, cy: ay, r: 4.5,
+    fill: rgba(s.anchorColor || '#e91e8c', s.anchorOpacity != null ? s.anchorOpacity : 1),
+    stroke: '#fff', 'stroke-width': 1.2
+  }, g);
+  const bg = rgba(s.bgColor || '#1e222d', s.bgOpacity != null ? s.bgOpacity : 0.95);
+  const border = rgba(s.borderColor || '#363a45', s.borderOpacity != null ? s.borderOpacity : 1);
+  const rect = mk('rect', {
+    x: left, y: top, width: boxW, height: boxH, rx: 6, ry: 6,
+    fill: bg, stroke: border, 'stroke-width': s.width || 1
+  }, g);
+  if (!s.isPreview) {
+    hit(mk('circle', { cx: ax, cy: ay, r: 12, fill: 'transparent' }, g), s);
+    const hitR = mk('rect', { x: left, y: top, width: boxW, height: boxH, fill: 'transparent', class: 'note-body-hit' }, g);
+    hit(hitR, s);
+    hitR.setAttribute('data-note-edit', s.id);
+  }
+  const tAnchor = 'middle';
+  const tx0 = left + boxW / 2;
+  const ty0 = top + padY + size * 0.85;
+  addText(g, lines, tx0, ty0, tAnchor, s);
 }
 
 function render() {
@@ -2543,6 +2741,7 @@ function render() {
     else if (s.tool === 'vline') renderVLine(s, g, c, pw, ph);
     else if (s.tool === 'rect') renderRect(s, g, c, pw);
     else if (s.tool === 'fib') renderFib(s, g, c, pw);
+    else if (s.tool === 'note') renderNote(s, g, c);
     else if (isPosTool(s.tool)) pos = renderPosition(s, g, c, s.id === selectedShapeId);
     if (isPosTool(s.tool) && !pos) return;
     if (s.id === selectedShapeId) selInfo = { s, c, pos };
@@ -2804,12 +3003,16 @@ function positionPriceResetBtn() {
   try {
     const sw = chart.priceScale('right').width() || 56;
     const th = chart.timeScale().height() || 26;
-    priceResetBtn.style.right = Math.max(4, Math.round((sw - 22) / 2)) + 'px';
-    priceResetBtn.style.bottom = (th + 6) + 'px';
+    // Park the R button in the empty corner where the time scale and price scale meet
+    priceResetBtn.style.right = Math.max(2, Math.round((sw - 22) / 2)) + 'px';
+    priceResetBtn.style.bottom = Math.max(2, Math.round((th - 22) / 2)) + 'px';
   } catch (e) {
     priceResetBtn.style.right = '18px';
-    priceResetBtn.style.bottom = '32px';
+    priceResetBtn.style.bottom = '8px';
   }
+  // Dark filled look only while the scale is in auto mode; outline when user-zoomed
+  priceResetBtn.classList.toggle('is-auto', !priceScaleManual);
+  priceResetBtn.classList.toggle('is-manual', !!priceScaleManual);
 }
 new ResizeObserver(() => positionPriceResetBtn()).observe(chartContainer);
 positionPriceResetBtn();
@@ -2847,9 +3050,10 @@ function scrollToLatestCandle() {
   if (!displayLen) return;
   const lr = chart.timeScale().getVisibleLogicalRange();
   const bars = lr && isFinite(lr.to - lr.from) ? Math.max(20, lr.to - lr.from) : Math.min(500, displayLen);
-  const to = displayLen;
-  const from = Math.max(0, to - bars);
-  chart.timeScale().setVisibleLogicalRange({ from, to });
+  // Center the latest candle in the viewport (not pinned to the right edge)
+  const center = displayLen - 1;
+  const half = bars / 2;
+  chart.timeScale().setVisibleLogicalRange({ from: center - half, to: center + half });
   dirty = true;
   updateGoToLatestBtn();
 }
@@ -4035,7 +4239,7 @@ function performUndo() {
       applyTimeframe(currentTimeframe);
     } else {
       const rebuilt = buildSeriesForView(currentTimeframe);
-      candleSeries.setData(rebuilt);
+      candleSeries.setData(seriesDataForChart(rebuilt));
       shownData = rebuilt;
       displayLen = rebuilt.length;
       ctRef = null;
@@ -4079,6 +4283,7 @@ document.addEventListener('keydown', (e) => {
   else if (!e.shiftKey && e.code === 'KeyH') tool = 'hline';
   else if (!e.shiftKey && e.code === 'KeyJ') tool = 'hray';
   else if (!e.shiftKey && e.code === 'KeyV') tool = 'vline';
+  else if (!e.shiftKey && e.code === 'KeyN') tool = 'note';
   if (!tool) return;
   e.preventDefault();
   toggleDrawTool(tool);
@@ -4740,6 +4945,22 @@ chartContainer.addEventListener('mousemove', (e) => {
 });
 chartContainer.addEventListener('mouseleave', () => { if (!trPlus.matches(':hover') && trMenu.style.display !== 'block') trPlus.style.display = 'none'; });
 trPlus.addEventListener('mousedown', (e) => e.stopPropagation());
+// Keep the chart crosshair alive while the pointer is over the + button
+trPlus.addEventListener('mousemove', (e) => {
+  try {
+    const r = chartContainer.getBoundingClientRect();
+    const y = e.clientY - r.top;
+    const x = e.clientX - r.left;
+    const price = candleSeries.coordinateToPrice(y);
+    const time = xToTime(x);
+    if (price != null && time != null && isFinite(price)) {
+      chart.setCrosshairPosition(price, time, candleSeries);
+    }
+  } catch (err) { /* older lightweight-charts builds */ }
+});
+trPlus.addEventListener('mouseleave', () => {
+  try { chart.clearCrosshairPosition(); } catch (err) { /* ignore */ }
+});
 trPlus.addEventListener('click', (e) => {
   e.stopPropagation();
   if (trMenu.style.display === 'block') { trCloseMenu(); return; }
