@@ -977,9 +977,10 @@ function styleSnapshot(s) {
   for (const k in s) if (!STYLE_SKIP.has(k)) o[k] = s[k];
   return clone(o);
 }
-function listTemplates(tool) {
+function listTemplates(tool) { // alphabetical, not in the order they were created
   const arr = drawTemplates[tool];
-  return Array.isArray(arr) ? arr : [];
+  if (!Array.isArray(arr)) return [];
+  return arr.slice().sort((a, b) => String(a.name).localeCompare(String(b.name), undefined, { numeric: true, sensitivity: 'base' }));
 }
 function saveTemplate(tool, name, style) {
   const n = String(name || '').trim();
@@ -4360,7 +4361,7 @@ fileInput.addEventListener('change', async (e) => {
   restoreLabel();
 });
 
-document.getElementById('clearCacheBtn').addEventListener('click', async () => {
+async function clearAllData() {
   if (!rawCandles.length && !drawings.length) return alert('Cache is already empty.');
   if (!confirm('Clear all cached candles, drawings, tool styles and the saved replay position?')) return;
 
@@ -4380,7 +4381,55 @@ document.getElementById('clearCacheBtn').addEventListener('click', async () => {
   fileNameSpan.textContent = '';
   redrawDrawings();
   lastPersistSig = persistSignature(); persistReady = true;
-});
+}
+
+// Candles only: removes the uploaded price data (and the replay position that belongs to it) but keeps
+// drawings, tool styles, templates, indicators and the demo account.
+async function deleteCandlesFromDB() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const st = tx.objectStore(STORE_NAME);
+    st.delete('rawCandles'); st.delete('replayTimestamp'); st.delete('symbol');
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function clearCandleData() {
+  if (!rawCandles.length) return alert('There is no candle data to clear.');
+  if (!confirm('Clear all candle data and the replay position?\n\nYour drawings, tool styles, templates and indicators are kept.')) return;
+  persistReady = false; clearTimeout(persistTimer);
+  if (dlgShapeId !== null) closeDialog(false);
+  await deleteCandlesFromDB();
+  rawCandles = []; tfCache.clear(); currentDataCache = []; displayLen = 0;
+  replayTimestamp = null; replayRawIndex = -1; selectingBarMode = false; setSymbol('');
+  deselect();
+  document.getElementById('btn-select-bar').classList.remove('active');
+  chartContainer.style.cursor = 'default';
+  candleSeries.setData([]);
+  shownData = []; rawVer++; trackerCache.clear();
+  updateStatusBar([]);
+  syncIndicators(false);
+  fileNameSpan.textContent = '';
+  redrawDrawings();
+  lastPersistSig = persistSignature(); persistReady = true;
+  schedulePersist();
+  try { trToast('Candle data cleared - drawings kept'); } catch (e) { /* optional */ }
+}
+(function setupClearMenu() {
+  const btn = document.getElementById('clearCacheBtn'), menu = document.getElementById('clearMenu');
+  btn.addEventListener('click', (e) => { e.stopPropagation(); menu.hidden = !menu.hidden; });
+  menu.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-clear]');
+    if (!b) return;
+    menu.hidden = true;
+    if (b.dataset.clear === 'candles') clearCandleData(); else clearAllData();
+  });
+  document.addEventListener('mousedown', (e) => {
+    if (!menu.hidden && !menu.contains(e.target) && !btn.contains(e.target)) menu.hidden = true;
+  }, true);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !menu.hidden) menu.hidden = true; });
+})();
 
 async function setTimeframe(tf) {
   if (tf === currentTimeframe) return; // ignore no-op clicks
@@ -5062,11 +5111,12 @@ $p('trpReset').addEventListener('click', () => {
 });
 function trStats() {
   const closed = Array.isArray(tr.closed) ? tr.closed : [];
-  const n = closed.length;
-  if (!n) return { n: 0, winRate: null, avgRR: null, wins: 0, losses: 0 };
   const wins = closed.filter(c => c.pnl > 0);
   const losses = closed.filter(c => c.pnl < 0);
-  const winRate = (wins.length / n) * 100;
+  const n = closed.length;                         // every closed trade (shown as "Trades")
+  const decided = wins.length + losses.length;     // win rate ignores break-even trades
+  if (!decided) return { n, decided: 0, winRate: null, avgRR: null, wins: 0, losses: 0 };
+  const winRate = (wins.length / decided) * 100;
   // Average realized R:R = avg win $ / avg loss $ (absolute). Falls back to null if no losses.
   let avgRR = null;
   if (wins.length && losses.length) {
@@ -5076,7 +5126,7 @@ function trStats() {
   } else if (wins.length && !losses.length) {
     avgRR = Infinity; // all winners
   }
-  return { n, winRate, avgRR, wins: wins.length, losses: losses.length };
+  return { n, decided, winRate, avgRR, wins: wins.length, losses: losses.length };
 }
 function trUpdateUI(force) {
   const last = trLastBar();
@@ -5092,7 +5142,7 @@ function trUpdateUI(force) {
   set('trpReal', trMoney(tr.realized, true), tr.realized > 0 ? 'pos' : tr.realized < 0 ? 'neg' : '');
   const st = trStats();
   set('trpTrades', st.n ? String(st.n) : '0');
-  set('trpWin', st.winRate == null ? '\u2014' : `${st.winRate.toFixed(1)}%` + (st.n ? ` (${st.wins}W/${st.losses}L)` : ''), st.winRate != null && st.winRate >= 50 ? 'pos' : st.winRate != null ? 'neg' : '');
+  set('trpWin', st.winRate == null ? '\u2014' : `${st.winRate.toFixed(1)}%` + (st.decided ? ` (${st.wins}W/${st.losses}L)` : ''), st.winRate != null && st.winRate >= 50 ? 'pos' : st.winRate != null ? 'neg' : '');
   set('trpRR', st.avgRR == null ? '\u2014' : !isFinite(st.avgRR) ? '\u221e' : `1 : ${st.avgRR.toFixed(2)}`, st.avgRR != null && st.avgRR >= 1 ? 'pos' : st.avgRR != null ? 'neg' : '');
   if (document.activeElement !== $p('trpPv')) $p('trpPv').value = sp.pv;
   if (document.activeElement !== $p('trpTick')) $p('trpTick').value = sp.tick;
