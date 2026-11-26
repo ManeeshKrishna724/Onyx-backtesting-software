@@ -571,9 +571,11 @@ function scheduleIndicatorSync(delayMs = 0) {
     indSyncRaf = requestAnimationFrame(() => {
       indSyncRaf = 0;
       if (token !== pendingIndSync) return;
-      // Skip work entirely when no indicators are on the chart
-      if (indInst.some(i => indicatorActive(i))) syncIndicators(false);
-      dirty = true;
+      // Always sync when any instance exists — inactive ones must be removed
+      // from the chart (series + box/VP overlays). Skipping here left MOR
+      // markings visible on daily/hourly after a 1m–5m visibility range.
+      if (indInst.length || indSeries.size) syncIndicators(false);
+      else { indBoxCache.clear(); dirty = true; }
       updateGoToLatestBtn();
     });
   };
@@ -626,9 +628,13 @@ function applyTimeframe(tf, skipZoom = false, preserveView = false) {
     }
   }
   updateStatusBar(displayData);
-  // Paint candles first; indicators follow on the next idle tick so the first
-  // TF switch does not feel blocked by MOR / line recalculation.
-  scheduleIndicatorSync(tfChanged ? 50 : 0);
+  // Paint candles first; then rebuild indicators so visibility ranges
+  // (e.g. 1m–5m only) remove series/boxes on hour/day/week charts.
+  if (tfChanged) {
+    // Invalidate the active-key so the next sync always rebuilds (hide inactive)
+    indActiveKey = '';
+  }
+  scheduleIndicatorSync(tfChanged ? 30 : 0);
   scheduleGoToLatest();
   if (tfChanged) schedulePersist();
 }
@@ -4017,8 +4023,13 @@ function syncIndicators(force) {
     const plotOn = i.plots ? Object.keys(i.plots).map(k => (i.plots[k] && i.plots[k].on === false ? '0' : '1')).join('') : '';
     return i.uid + on + plotOn;
   }).join(',');
-  if (force || key !== indActiveKey) { indActiveKey = key; rebuildIndicators(); }
-  updateIndicatorData();
+  if (force || key !== indActiveKey) {
+    indActiveKey = key;
+    rebuildIndicators(); // drops series/boxes for indicators outside the TF visibility range
+  }
+  // Only compute data when something is actually on the chart
+  if (indSeries.size) updateIndicatorData();
+  else dirty = true; // clear any leftover SVG box/VP drawings
 }
 
 // ---- UI helpers
