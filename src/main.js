@@ -220,38 +220,55 @@ const nyFormatter = new Intl.DateTimeFormat('en-US', {
   hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false
 });
 
+// Cache NY wall-clock breakdowns. Intl.DateTimeFormat is the hot cost in
+// session alignment, indicator day buckets, and marker mapping during skip.
+const _nyDetailCache = new Map();
+const NY_DETAIL_CACHE_MAX = 20000;
 function getNYTimeDetails(timestampUTC) {
+  const key = timestampUTC | 0;
+  let ny = _nyDetailCache.get(key);
+  if (ny) return ny;
   const d = new Date(timestampUTC * 1000);
   const parts = nyFormatter.formatToParts(d);
-  const ny = {};
+  ny = {};
   for (const p of parts) { if (p.type !== 'literal') ny[p.type] = parseInt(p.value, 10); }
   if (ny.hour === 24) ny.hour = 0;
+  if (_nyDetailCache.size >= NY_DETAIL_CACHE_MAX) _nyDetailCache.clear();
+  _nyDetailCache.set(key, ny);
   return ny;
 }
 
+const _sessKeyCache = new Map(); // `${tf}|${utc}` -> key
+const SESS_KEY_CACHE_MAX = 30000;
 function getSessionAlignedKey(utcSeconds, tf) {
+  const ck = tf + '|' + (utcSeconds | 0);
+  let hit = _sessKeyCache.get(ck);
+  if (hit !== undefined) return hit;
+
   const ny = getNYTimeDetails(utcSeconds);
   const nyMathTime = Date.UTC(ny.year, ny.month - 1, ny.day, ny.hour, ny.minute, ny.second);
   const shiftedTime = nyMathTime + (6 * 3600 * 1000);
   const shiftedDate = new Date(shiftedTime);
+  let key;
 
-  if (tf === '1D') return `${shiftedDate.getUTCFullYear()}-${String(shiftedDate.getUTCMonth() + 1).padStart(2, '0')}-${String(shiftedDate.getUTCDate()).padStart(2, '0')}`;
-  if (tf === '1W') {
+  if (tf === '1D') {
+    key = `${shiftedDate.getUTCFullYear()}-${String(shiftedDate.getUTCMonth() + 1).padStart(2, '0')}-${String(shiftedDate.getUTCDate()).padStart(2, '0')}`;
+  } else if (tf === '1W') {
     const dayOfWeek = shiftedDate.getUTCDay();
     const diff = shiftedDate.getUTCDate() - dayOfWeek + (dayOfWeek === 0 ? -6 : 1);
     shiftedDate.setUTCDate(diff);
-    return `${shiftedDate.getUTCFullYear()}-${String(shiftedDate.getUTCMonth() + 1).padStart(2, '0')}-${String(shiftedDate.getUTCDate()).padStart(2, '0')}`;
+    key = `${shiftedDate.getUTCFullYear()}-${String(shiftedDate.getUTCMonth() + 1).padStart(2, '0')}-${String(shiftedDate.getUTCDate()).padStart(2, '0')}`;
+  } else {
+    const intervalSec = (parseInt(tf, 10) || 1) * 60;
+    const shiftedSec = Math.floor(shiftedTime / 1000);
+    const bucketShifted = Math.floor(shiftedSec / intervalSec) * intervalSec;
+    const nyAsUtcSec = Math.floor(nyMathTime / 1000);
+    const offset = nyAsUtcSec - utcSeconds;
+    key = bucketShifted - offset - 6 * 3600;
   }
-
-  const intervalSec = (parseInt(tf, 10) || 1) * 60;
-  // Monotonic key: floor shifted NY-math time to the interval, then convert back to a
-  // comparable UTC-ish second. Using shifted space avoids non-monotonic buckets on 2/10/30/45m.
-  const shiftedSec = Math.floor(shiftedTime / 1000);
-  const bucketShifted = Math.floor(shiftedSec / intervalSec) * intervalSec;
-  // Map back: real utc = ny-math-as-utc equivalent correction applied to bucket
-  const nyAsUtcSec = Math.floor(nyMathTime / 1000);
-  const offset = nyAsUtcSec - utcSeconds; // NY-wall-as-UTC minus real UTC
-  return bucketShifted - offset - 6 * 3600;
+  if (_sessKeyCache.size >= SESS_KEY_CACHE_MAX) _sessKeyCache.clear();
+  _sessKeyCache.set(ck, key);
+  return key;
 }
 
 // ========== PARSER & MERGE ==========
@@ -543,15 +560,19 @@ function binaryCutoffIndex(data, ts) {
 
 let pendingIndSync = 0;
 let indSyncTimer = null;
+let indSyncRaf = 0;
 function scheduleIndicatorSync(delayMs = 0) {
-  // Coalesce rapid replay steps / TF clicks into one indicator rebuild
+  // Coalesce rapid replay steps / TF clicks into ONE indicator rebuild after idle
   const token = ++pendingIndSync;
   if (indSyncTimer) { clearTimeout(indSyncTimer); indSyncTimer = null; }
+  if (indSyncRaf) { cancelAnimationFrame(indSyncRaf); indSyncRaf = 0; }
   const run = () => {
     indSyncTimer = null;
-    requestAnimationFrame(() => {
+    indSyncRaf = requestAnimationFrame(() => {
+      indSyncRaf = 0;
       if (token !== pendingIndSync) return;
-      if (indInst.length) syncIndicators(false);
+      // Skip work entirely when no indicators are on the chart
+      if (indInst.some(i => indicatorActive(i))) syncIndicators(false);
       dirty = true;
       updateGoToLatestBtn();
     });
@@ -568,7 +589,7 @@ function applyTimeframe(tf, skipZoom = false, preserveView = false) {
   const tfChanged = tf !== currentTimeframe;
 
   currentTimeframe = tf;
-  if (tfChanged) trackerCache.clear();
+  if (tfChanged) { trackerCache.clear(); indBoxCache.clear(); _sessKeyCache.clear(); trMarkAlign.clear(); }
   dirty = true;
   document.querySelectorAll('.timeframes button').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.tf === tf);
@@ -682,8 +703,10 @@ function stepReplay(steps) {
 
   // Keep a raw-array cursor so normal forward replay never binary-searches or
   // rebuilds the complete historical prefix on every button press.
+  // replayTimestamp is the CLOSE of the 1m bar (open + 59), not the open time.
   let cur = replayRawIndex;
-  if (cur < 0 || getComparableTime(rawCandles[cur]?.time) !== replayTimestamp) {
+  const curOpen = cur >= 0 && cur < rawCandles.length ? getComparableTime(rawCandles[cur].time) : null;
+  if (cur < 0 || curOpen == null || curOpen + 59 !== replayTimestamp) {
     cur = rawIndexAtOrBefore(replayTimestamp);
   }
   if (cur < 0) return;
@@ -754,6 +777,12 @@ function stepReplay(steps) {
   }
   if (targetIdx === cur) return;
 
+  // Keep ctArr in sync without rebuilding the whole array on every step
+  const ensureCtAppend = (t) => {
+    if (ctRef === shownData && Array.isArray(ctArr)) ctArr.push(getComparableTime(t));
+    else ctRef = null; // force rebuild next time someone needs full ctimes
+  };
+
   // Backward stepping rebuilds the visible aggregate safely.
   if (targetIdx < cur) {
     replayRawIndex = targetIdx;
@@ -763,45 +792,54 @@ function stepReplay(steps) {
     shownData = rebuilt;
     displayLen = rebuilt.length;
     ctRef = null;
-  } else {
-    // Forward: incremental update — only the new bars, no full history rebuild
+  } else if (isOneMinute) {
+    // Fast path: 1m only — push + single LWC update per new bar, no session keys
     for (let i = cur + 1; i <= targetIdx; i++) {
       const raw = rawCandles[i];
       const rawTime = getComparableTime(raw.time);
-      let next;
-
-      if (isOneMinute) {
-        next = { time: rawTime, open: raw.open, high: raw.high, low: raw.low, close: raw.close, volume: raw.volume || 0 };
-        shownData.push(next);
-        displayLen = shownData.length;
-        candleSeries.update(next);
+      const next = { time: rawTime, open: raw.open, high: raw.high, low: raw.low, close: raw.close, volume: raw.volume || 0 };
+      shownData.push(next);
+      ensureCtAppend(rawTime);
+      candleSeries.update(next);
+    }
+    displayLen = shownData.length;
+  } else {
+    // Higher TF forward: aggregate into the forming bucket
+    let next = null;
+    for (let i = cur + 1; i <= targetIdx; i++) {
+      const raw = rawCandles[i];
+      const rawTime = getComparableTime(raw.time);
+      const bucketTime = getSessionAlignedKey(rawTime, currentTimeframe);
+      const last = shownData[shownData.length - 1];
+      const lastTime = last ? getComparableTime(last.time) : null;
+      if (last && lastTime === getComparableTime(bucketTime)) {
+        last.high = Math.max(last.high, raw.high);
+        last.low = Math.min(last.low, raw.low);
+        last.close = raw.close;
+        last.volume = (last.volume || 0) + (raw.volume || 0);
+        next = last;
       } else {
-        const bucketTime = getSessionAlignedKey(rawTime, currentTimeframe);
-        const last = shownData[shownData.length - 1];
-        const lastTime = last ? getComparableTime(last.time) : null;
-        if (last && lastTime === getComparableTime(bucketTime)) {
-          last.high = Math.max(last.high, raw.high);
-          last.low = Math.min(last.low, raw.low);
-          last.close = raw.close;
-          last.volume = (last.volume || 0) + (raw.volume || 0);
-          next = last;
-        } else {
-          next = { time: bucketTime, open: raw.open, high: raw.high, low: raw.low, close: raw.close, volume: raw.volume || 0 };
-          shownData.push(next);
-          displayLen = shownData.length;
-        }
-        candleSeries.update(next);
+        next = { time: bucketTime, open: raw.open, high: raw.high, low: raw.low, close: raw.close, volume: raw.volume || 0 };
+        shownData.push(next);
+        ensureCtAppend(bucketTime);
       }
     }
+    if (next) candleSeries.update(next); // one LWC call for the whole step
     displayLen = shownData.length;
   }
 
   replayRawIndex = targetIdx;
   replayTimestamp = getComparableTime(rawCandles[targetIdx].time) + 59;
-  updateStatusBar(shownData);
-  dirty = true;
-  scheduleIndicatorSync(80);
-  updateGoToLatestBtn();
+  // Status: write the clock directly (no querySelector work)
+  sbReplay.hidden = false;
+  sbTime.textContent = formatStatusTime(replayTimestamp);
+  // Position tools only
+  if (drawings.some(d => isPosTool(d.tool))) dirty = true;
+  // Idle-only indicator sync: rapid scrubbing never pays for MOR/line rebuilds mid-burst
+  scheduleIndicatorSync(replayTimestamp != null ? 400 : 0);
+  // Defer go-to-latest visibility work
+  if (typeof scheduleGoToLatest === 'function') scheduleGoToLatest();
+  else updateGoToLatestBtn();
 }
 
 
@@ -1315,7 +1353,16 @@ function rawLowerBound(t) { // first raw candle with time >= t
 }
 function visibleRawEnd() { // raw candles at/after this index are hidden by replay
   if (replayTimestamp === null) return rawCandles.length;
-  // first raw candle with time STRICTLY greater than replayTimestamp
+  // Fast path: replayRawIndex is kept in lock-step with the cursor by stepReplay /
+  // select-bar. Prefer O(1) over a binary search on every animation frame.
+  if (replayRawIndex >= 0 && replayRawIndex < rawCandles.length) {
+    const t = getComparableTime(rawCandles[replayRawIndex].time);
+    // Cursor stores the close of that 1m bar (open + 59). The next open is > cursor.
+    if (t != null && t <= replayTimestamp && (t + 59) >= replayTimestamp) {
+      return replayRawIndex + 1;
+    }
+  }
+  // Fallback binary search (cursor drifted or was restored from storage)
   let lo = 0, hi = rawCandles.length;
   while (lo < hi) {
     const m = (lo + hi) >> 1;
@@ -3076,6 +3123,11 @@ function scrollToLatestCandle() {
   dirty = true;
   updateGoToLatestBtn();
 }
+let _goLatestTimer = null;
+function scheduleGoToLatest() {
+  if (_goLatestTimer) return;
+  _goLatestTimer = setTimeout(() => { _goLatestTimer = null; updateGoToLatestBtn(); }, 120);
+}
 function updateGoToLatestBtn() {
   if (!displayLen) {
     goToLatestBtn.hidden = true;
@@ -3761,6 +3813,7 @@ function clearIndicatorSeries() {
 }
 function rebuildIndicators() {
   clearIndicatorSeries();
+  indBoxCache.clear();
   let pane = 0;
   for (const inst of indInst) {
     if (!indicatorActive(inst)) continue;
@@ -3819,6 +3872,10 @@ function rebuildIndicators() {
     for (let i = 1; i < panes.length; i++) panes[i].setHeight(h);
   } catch (e) { /* older API */ }
 }
+// Cache box / VP indicator outputs across rapid replay steps. Midnight ranges
+// only change when a new NY calendar day enters the visible history — not on
+// every 1m skip — so recomputing them each click is pure waste.
+const indBoxCache = new Map(); // uid -> { sig, out }
 function updateIndicatorData() {
   // Ensure box-only indicators are still registered even if series map was empty
   if (!indSeries.size && indInst.some(i => indicatorActive(i))) {
@@ -3828,31 +3885,42 @@ function updateIndicatorData() {
 
   const hasBoxes = [...indSeries.values()].some(rt => (rt.boxes && Object.keys(rt.boxes).length) || (rt.vp && Object.keys(rt.vp).length));
 
-  // Box indicators need enough *calendar* history so every past-day range is in the
-  // slice. 2500 bars on 1m is ~2 days; the same count on 5m covers ~1 week — that is
-  // why 5m showed all 6 MORs while 1m only showed 2.
-  let maxBars = indMaxBars();
-  if (hasBoxes) maxBars = Math.max(maxBars, historyBarsForBoxes());
+  // Line/histogram: short visible window. Boxes: enough calendar history for past days.
+  const lineMax = indMaxBars();
+  const boxMax = hasBoxes ? Math.max(lineMax, historyBarsForBoxes()) : lineMax;
 
-  let off = Math.max(0, shownData.length - maxBars);
-  // Visible-range clipping is fine for lines; it hides older box ranges — skip when boxes exist
-  if (!hasBoxes) {
-    try {
-      const lr = chart.timeScale().getVisibleLogicalRange();
-      if (lr && isFinite(lr.from) && isFinite(lr.to)) {
-        const visFrom = Math.max(0, Math.floor(lr.from) - 200);
-        const visTo = Math.min(shownData.length, Math.ceil(lr.to) + 2);
-        if (visTo - visFrom < maxBars) off = visFrom;
-        else off = Math.max(off, visTo - maxBars);
-      }
-    } catch (e) { /* ignore */ }
-  }
-  const slice = off ? shownData.slice(off) : shownData;
-  let d = null;
+  let lineOff = Math.max(0, shownData.length - lineMax);
+  try {
+    const lr = chart.timeScale().getVisibleLogicalRange();
+    if (lr && isFinite(lr.from) && isFinite(lr.to)) {
+      const visFrom = Math.max(0, Math.floor(lr.from) - 200);
+      const visTo = Math.min(shownData.length, Math.ceil(lr.to) + 2);
+      if (visTo - visFrom < lineMax) lineOff = visFrom;
+      else lineOff = Math.max(lineOff, visTo - lineMax);
+    }
+  } catch (e) { /* ignore */ }
+  const boxOff = Math.max(0, shownData.length - boxMax);
+
+  const lineSlice = lineOff ? shownData.slice(lineOff) : shownData;
+  const boxSlice = hasBoxes ? (boxOff ? shownData.slice(boxOff) : shownData) : lineSlice;
+  let dLine = null, dBox = null;
   let errorsChanged = false;
+
+  // Signature for "has a new midnight entered the box slice?"
+  const lastBar = shownData.length ? shownData[shownData.length - 1] : null;
+  const lastT = lastBar ? getComparableTime(lastBar.time) : null;
+  let lastNyDay = '';
+  if (lastT != null) {
+    const ny = getNYTimeDetails(lastT);
+    lastNyDay = ny.year + '-' + ny.month + '-' + ny.day;
+  }
+  const boxHistSig = `${currentTimeframe}|${boxSlice.length}|${boxOff}|${lastNyDay}|${rawVer}`;
+
   indSeries.forEach((rt, uid) => {
     const inst = indInst.find(i => i.uid === uid), rec = inst && indDefs.get(inst.libId);
     if (!rec || !rec.def) return;
+    const needsBox = !!(rt.boxes && Object.keys(rt.boxes).length) || !!(rt.vp && Object.keys(rt.vp).length);
+    const needsLine = !!(rt.series && Object.keys(rt.series).length);
     let out = null, err = null;
     const inputs = {};
     for (const [k, i] of Object.entries(rec.def.inputs)) {
@@ -3861,20 +3929,45 @@ function updateIndicatorData() {
       if (i.type === 'bool') v = v !== false && v !== 0 && v !== 'false';
       inputs[k] = v;
     }
+    const inputSig = JSON.stringify(inputs);
+
     try {
-      if (slice.length) {
-        if (!d) d = buildIndicatorSource(slice);
-        out = rec.def.calculate(d, inputs, TA);
+      if (needsBox && !needsLine) {
+        // Pure box/VP indicator: reuse previous output until the NY day set changes
+        const cacheKey = uid;
+        const sig = boxHistSig + '|' + inputSig;
+        const cached = indBoxCache.get(cacheKey);
+        if (cached && cached.sig === sig) {
+          out = cached.out;
+        } else if (boxSlice.length) {
+          if (!dBox) dBox = buildIndicatorSource(boxSlice);
+          out = rec.def.calculate(dBox, inputs, TA);
+          indBoxCache.set(cacheKey, { sig, out });
+        }
+      } else {
+        // Line or mixed: recompute on the short visible window (and box slice if needed)
+        const slice = needsBox ? boxSlice : lineSlice;
+        if (slice.length) {
+          if (needsBox) {
+            if (!dBox) dBox = buildIndicatorSource(boxSlice);
+            out = rec.def.calculate(dBox, inputs, TA);
+          } else {
+            if (!dLine) dLine = buildIndicatorSource(lineSlice);
+            out = rec.def.calculate(dLine, inputs, TA);
+          }
+        }
       }
     } catch (e) { err = `Runtime error: ${e.message}`; console.error('Indicator error', inst.libId, e); }
     if ((rec.runtimeError || null) !== err) { rec.runtimeError = err; errorsChanged = true; }
-    for (const [key, s] of Object.entries(rt.series)) {
+
+    const lineSliceRef = needsBox ? boxSlice : lineSlice;
+    for (const [key, s] of Object.entries(rt.series || {})) {
       const arr = out && out[key], hist = rec.def.plots[key].type === 'histogram', st = inst.plots[key], pts = [];
-      if (Array.isArray(arr) && arr.length === slice.length) {
-        for (let i = 0; i < slice.length; i++) {
+      if (Array.isArray(arr) && arr.length === lineSliceRef.length) {
+        for (let i = 0; i < lineSliceRef.length; i++) {
           const v = arr[i];
-          if (typeof v === 'number' && isFinite(v)) pts.push(hist ? { time: slice[i].time, value: v, color: v >= 0 ? st.color : st.colorNeg } : { time: slice[i].time, value: v });
-          else pts.push({ time: slice[i].time });
+          if (typeof v === 'number' && isFinite(v)) pts.push(hist ? { time: lineSliceRef[i].time, value: v, color: v >= 0 ? st.color : st.colorNeg } : { time: lineSliceRef[i].time, value: v });
+          else pts.push({ time: lineSliceRef[i].time });
         }
       }
       try { s.setData(pts); } catch (e) { /* ignore */ }
@@ -4354,7 +4447,7 @@ fileInput.addEventListener('change', async (e) => {
   for (const p of valid) incoming = mergeCandles(incoming, p.candles); // upload order does not matter
   rawCandles = mergeCandles(rawCandles, incoming);
   if (!currentSymbol && syms[0]) setSymbol(syms[0]);
-  tfCache.clear(); rawVer++; trackerCache.clear();
+  tfCache.clear(); rawVer++; trackerCache.clear(); indBoxCache.clear();
   await saveToDB(rawCandles, currentTimeframe);
   applyTimeframe(currentTimeframe);
   schedulePersist();
@@ -4375,7 +4468,7 @@ async function clearAllData() {
   chartContainer.style.cursor = 'default';
   
   candleSeries.setData([]);
-  shownData = []; rawVer++; trackerCache.clear();
+  shownData = []; rawVer++; trackerCache.clear(); indBoxCache.clear();
   updateStatusBar([]);
   syncIndicators(false);
   fileNameSpan.textContent = '';
@@ -4407,7 +4500,7 @@ async function clearCandleData() {
   document.getElementById('btn-select-bar').classList.remove('active');
   chartContainer.style.cursor = 'default';
   candleSeries.setData([]);
-  shownData = []; rawVer++; trackerCache.clear();
+  shownData = []; rawVer++; trackerCache.clear(); indBoxCache.clear();
   updateStatusBar([]);
   syncIndicators(false);
   fileNameSpan.textContent = '';
@@ -4764,6 +4857,9 @@ function trAdvance() {
 // ---------- trade arrows on the candles ----------
 const trMarkers = createSeriesMarkers(candleSeries, []);
 let trMarkSig = '';
+// Per-timeframe cache of exec.t -> session-aligned key (avoids Intl on every frame)
+let trMarkAlignTf = '';
+const trMarkAlign = new Map();
 function trUpdateMarkers() {
   const data = shownData;
   const show = tr.showMarkers !== false;
@@ -4771,12 +4867,16 @@ function trUpdateMarkers() {
   if (sig === trMarkSig) return;
   trMarkSig = sig;
   if (!show || !data || !data.length || !tr.execs.length) { trMarkers.setMarkers([]); return; }
+  if (trMarkAlignTf !== currentTimeframe) { trMarkAlign.clear(); trMarkAlignTf = currentTimeframe; }
   const first = getComparableTime(data[0].time), last = getComparableTime(data[data.length - 1].time);
-  // One marker per bar + side + kind (sum qtys) so stacked duplicates never draw.
-  // Keep entry fills and exit (TP/SL/close) as separate kinds so both appear.
   const map = new Map();
   for (const ex of tr.execs) {
-    const key = getSessionAlignedKey(ex.t, currentTimeframe), kc = getComparableTime(key);
+    let key = trMarkAlign.get(ex.t);
+    if (key === undefined) {
+      key = getSessionAlignedKey(ex.t, currentTimeframe);
+      trMarkAlign.set(ex.t, key);
+    }
+    const kc = getComparableTime(key);
     if (kc == null || kc < first || kc > last) continue;
     const kind = (ex.kind === 'tp' || ex.kind === 'sl' || ex.kind === 'close') ? ex.kind : 'fill';
     const id = `${kc}|${ex.side}|${kind}`;
@@ -4786,7 +4886,6 @@ function trUpdateMarkers() {
   }
   const out = [...map.values()].sort((a, b) => a.kc - b.kc).map(m => {
     const buy = m.side === 'buy';
-    // Entries: blue up / red down. Exits use opposite arrow so both ends of a trade are visible.
     const isExit = m.kind === 'tp' || m.kind === 'sl' || m.kind === 'close';
     const entryBuy = buy;
     return {
@@ -5155,13 +5254,23 @@ function trUpdateUI(force) {
 let trSig = '', trUiAt = 0;
 function trLoop(now) {
   try {
-    trAdvance();
-    const ts = chart.timeScale(), lr = ts.getVisibleLogicalRange(), lb = trLastBar();
-    const sig = [lr ? lr.from : '', lr ? lr.to : '', candleSeries.priceToCoordinate(0), candleSeries.priceToCoordinate(1000),
-      chartContainer.clientWidth, chartContainer.clientHeight, trVer, lb ? lb.c : '', currentTimeframe, currentDataCache.length].join('|');
-    if (sig !== trSig) { trSig = sig; trRender(); }
-    trUpdateMarkers();
-    if (now - trUiAt > 150) { trUiAt = now; trUpdateUI(false); }
+    // Only run matching when the replay cursor actually moved or orders exist
+    if (tr.trades.length || tr.orders.length || trLastEnd < 0) trAdvance();
+    else if (replayTimestamp != null && replayRawIndex >= 0) {
+      // O(1) keep trLastEnd in sync without scanning
+      const end = replayRawIndex + 1;
+      if (end !== trLastEnd) trLastEnd = end;
+    }
+    const needOverlay = tr.trades.length || tr.orders.length;
+    if (needOverlay) {
+      const lr = chart.timeScale().getVisibleLogicalRange();
+      const lb = trLastBar();
+      const sig = [lr ? lr.from : '', lr ? lr.to : '', trVer, lb ? lb.c : '', currentTimeframe, chartContainer.clientWidth].join('|');
+      if (sig !== trSig) { trSig = sig; trRender(); }
+    }
+    // Markers only when exec count / series end changed (sig check inside)
+    if (tr.execs.length && tr.showMarkers !== false) trUpdateMarkers();
+    if (now - trUiAt > 200) { trUiAt = now; trUpdateUI(false); }
   } catch (e) { /* never let the trading layer break the chart */ }
   requestAnimationFrame(trLoop);
 }
