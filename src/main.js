@@ -589,7 +589,7 @@ function applyTimeframe(tf, skipZoom = false, preserveView = false) {
   const tfChanged = tf !== currentTimeframe;
 
   currentTimeframe = tf;
-  if (tfChanged) { trackerCache.clear(); indBoxCache.clear(); _sessKeyCache.clear(); trMarkAlign.clear(); }
+  if (tfChanged) { trackerCache.clear(); indBoxCache.clear(); trMarkAlign.clear(); }
   dirty = true;
   document.querySelectorAll('.timeframes button').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.tf === tf);
@@ -626,10 +626,10 @@ function applyTimeframe(tf, skipZoom = false, preserveView = false) {
     }
   }
   updateStatusBar(displayData);
-  // Do not block the timeframe switch on indicator recomputation. Coalesce
-  // rapid timeframe clicks into one indicator refresh after the chart updates.
-  scheduleIndicatorSync(0);
-  updateGoToLatestBtn();
+  // Paint candles first; indicators follow on the next idle tick so the first
+  // TF switch does not feel blocked by MOR / line recalculation.
+  scheduleIndicatorSync(tfChanged ? 50 : 0);
+  scheduleGoToLatest();
   if (tfChanged) schedulePersist();
 }
 
@@ -4846,12 +4846,15 @@ function trAdvance() {
   // Going forward: only match TP / SL / resting limits on newly revealed bars.
   // User actions (market / limit / close) are applied at click time and on rebuild after rewind —
   // never again while scrubbing forward (otherwise refresh multiplies arrows).
+  const open0 = tr.trades.length + tr.orders.length;
   for (let i = trLastEnd; i < end; i++) {
     if (tr.trades.length || tr.orders.length) trProcessCandle(rawCandles[i]);
   }
+  const open1 = tr.trades.length + tr.orders.length;
   if (trNotes.length) { trToast(trNotes.slice(-2).join('   |   ')); trNotes = []; }
   trLastEnd = end;
-  if (tr.trades.length || tr.orders.length || tr.execs.length) trTouch();
+  // Always touch when size changed (fill/close) so overlay + account panel refresh without a page reload
+  if (open1 !== open0 || tr.trades.length || tr.orders.length || tr.execs.length) trTouch();
 }
 
 // ---------- trade arrows on the candles ----------
@@ -5254,23 +5257,28 @@ function trUpdateUI(force) {
 let trSig = '', trUiAt = 0;
 function trLoop(now) {
   try {
-    // Only run matching when the replay cursor actually moved or orders exist
-    if (tr.trades.length || tr.orders.length || trLastEnd < 0) trAdvance();
-    else if (replayTimestamp != null && replayRawIndex >= 0) {
-      // O(1) keep trLastEnd in sync without scanning
-      const end = replayRawIndex + 1;
-      if (end !== trLastEnd) trLastEnd = end;
-    }
-    const needOverlay = tr.trades.length || tr.orders.length;
-    if (needOverlay) {
+    const openBefore = tr.trades.length + tr.orders.length;
+    // Always run advance: early-returns when the cursor has not moved.
+    // Skipping it previously left TP/SL unprocessed and the overlay stuck after a close.
+    trAdvance();
+    const openAfter = tr.trades.length + tr.orders.length;
+    // Redraw when something is open, OR when a trade/order just closed (must clear chips)
+    if (openAfter || openBefore || trVer) {
       const lr = chart.timeScale().getVisibleLogicalRange();
       const lb = trLastBar();
-      const sig = [lr ? lr.from : '', lr ? lr.to : '', trVer, lb ? lb.c : '', currentTimeframe, chartContainer.clientWidth].join('|');
+      const sig = [lr ? lr.from : '', lr ? lr.to : '', trVer, lb ? lb.c : '', currentTimeframe,
+        chartContainer.clientWidth, openAfter].join('|');
       if (sig !== trSig) { trSig = sig; trRender(); }
     }
-    // Markers only when exec count / series end changed (sig check inside)
     if (tr.execs.length && tr.showMarkers !== false) trUpdateMarkers();
-    if (now - trUiAt > 200) { trUiAt = now; trUpdateUI(false); }
+    // Force account UI refresh immediately after a fill/close
+    if (openAfter !== openBefore || trNotes.length) {
+      trUpdateUI(true);
+      trUiAt = now;
+    } else if (now - trUiAt > 200) {
+      trUiAt = now;
+      trUpdateUI(false);
+    }
   } catch (e) { /* never let the trading layer break the chart */ }
   requestAnimationFrame(trLoop);
 }
