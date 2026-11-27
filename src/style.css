@@ -903,3 +903,81 @@ input:disabled + .box { opacity: 0.6; }
 .chart-container.drawing-mode > svg * {
   pointer-events: none !important;
 }
+
+/* ----- per-chart manual time offset controls ----- */
+.sb-chip.sb-off {
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 11.5px;
+  color: #a9bcff;
+  background: rgba(61, 107, 255, 0.14);
+  border: 1px solid rgba(61, 107, 255, 0.38);
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.sb-chip.sb-off:hover {
+  background: rgba(61, 107, 255, 0.26);
+  border-color: rgba(61, 107, 255, 0.65);
+  color: #fff;
+}
+.pane-off-btn {
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.pane-off-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+}
+.pane-off-btn.has-offset {
+  color: #a9bcff;
+  background: rgba(61, 107, 255, 0.16);
+  border-color: rgba(61, 107, 255, 0.45);
+}
+.cs-off-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.cs-off-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #9a9a9a;
+  font-size: 12px;
+}
+.cs-off-field .dlg-num {
+  width: 64px;
+  text-align: right;
+  padding: 4px 6px;
+}
+.cs-off-zero {
+  height: 28px;
+  padding: 0 9px;
+  border-radius: 5px;
+  border: 1px solid #4a4a4a;
+  background: #1e1e1e;
+  color: #cfcfcf;
+  font-size: 11.5px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+}
+.cs-off-zero:hover {
+  border-color: #fff;
+  color: #fff;
+}
+.cs-off-total {
+  color: #a9bcff;
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}

@@ -64,7 +64,10 @@ const CHART_DEFAULTS = {
   vGridColor: '#2a2e39', vGridOp: 1, hGridColor: '#2a2e39', hGridOp: 1,
   textColor: '#d1d4dc', textOp: 1,
   scaleLineColor: '#2a2e39', scaleLineOp: 1,
-  crossColor: '#758696', crossOp: 1
+  crossColor: '#758696', crossOp: 1,
+  // per-chart manual time offsets (hours & minutes, no auto DST)
+  c1OffH: 0, c1OffM: 0,
+  c2OffH: 0, c2OffM: 0
 };
 const CHART_LS_KEY = 'backtester.chartSettings.v1';
 function loadChartSettings() {
@@ -75,6 +78,89 @@ function saveChartSettings() {
   try { localStorage.setItem(CHART_LS_KEY, JSON.stringify(chartCfg)); } catch (e) { /* storage unavailable */ }
 }
 let chartCfg = loadChartSettings();
+
+// Per-chart manual time offset helpers (applied once to raw timestamps -> zero frame lag)
+function chartOffsetSec(paneId) {
+  const h = Number(paneId === 1 ? chartCfg.c2OffH : chartCfg.c1OffH) || 0;
+  const m = Number(paneId === 1 ? chartCfg.c2OffM : chartCfg.c1OffM) || 0;
+  return Math.round(h * 3600 + m * 60);
+}
+function formatOffsetTag(sec) {
+  if (!sec) return '0m';
+  const sign = sec > 0 ? '+' : '-';
+  const abs = Math.abs(sec);
+  const h = Math.floor(abs / 3600);
+  const m = Math.floor((abs % 3600) / 60);
+  if (h && m) return `${sign}${h}h ${m}m`;
+  if (h) return `${sign}${h}h`;
+  return `${sign}${m}m`;
+}
+function applyOffsetToCandles(base, offsetSec) {
+  if (!Array.isArray(base) || !base.length) return [];
+  if (!offsetSec) return base;
+  const out = new Array(base.length);
+  for (let i = 0; i < base.length; i++) {
+    const c = base[i];
+    out[i] = typeof c.time === 'number' ? { ...c, time: c.time + offsetSec } : c;
+  }
+  return out;
+}
+function refreshOffsetBadges() {
+  const s1 = chartOffsetSec(0);
+  const s2 = chartOffsetSec(1);
+  const sbOff = document.getElementById('sbOff');
+  if (sbOff) {
+    sbOff.hidden = !s1;
+    sbOff.textContent = s1 ? `Offset ${formatOffsetTag(s1)}` : '';
+  }
+  const b0 = document.getElementById('pane0OffBtn');
+  if (b0) {
+    b0.textContent = formatOffsetTag(s1);
+    b0.classList.toggle('has-offset', !!s1);
+    b0.title = s1 ? `Chart 1 time offset: ${formatOffsetTag(s1)} (click to edit)` : 'Chart 1 time offset (click to edit)';
+  }
+  const b1 = document.getElementById('pane1OffBtn');
+  if (b1) {
+    b1.textContent = formatOffsetTag(s2);
+    b1.classList.toggle('has-offset', !!s2);
+    b1.title = s2 ? `Chart 2 time offset: ${formatOffsetTag(s2)} (click to edit)` : 'Chart 2 time offset (click to edit)';
+  }
+}
+function rebuildChart1FromOffset(preserveView = true) {
+  rawCandles = applyOffsetToCandles(baseRawCandles, chartOffsetSec(0));
+  tfCache.clear();
+  rawVer++;
+  trackerCache.clear();
+  indBoxCache.clear();
+  trMarkAlign.clear();
+  if (rawCandles.length) {
+    applyTimeframe(currentTimeframe, false, preserveView);
+    fileNameSpan.textContent = dataSummary();
+    try { trCursorSync(); } catch (e) { /* ignore */ }
+  } else {
+    updateStatusBar([]);
+  }
+  refreshOffsetBadges();
+  dirty = true;
+}
+function rebuildChart2FromOffset(preserveScale = true) {
+  refreshOffsetBadges();
+  if (!pane2) return;
+  pane2.rawCandles = applyOffsetToCandles(pane2.baseRawCandles || [], chartOffsetSec(1));
+  pane2.rawVer = (pane2.rawVer || 0) + 1;
+  pane2.tfCache.clear();
+  pane2._viewCache = null;
+  trackerCache.clear();
+  if (pane2.rawCandles.length) {
+    pane2ApplyTf(pane2.currentTimeframe || '1', { preserveScale });
+  } else {
+    try { pane2.candleSeries.setData([]); } catch (e) { /* ignore */ }
+    pane2.shownData = [];
+    pane2.displayLen = 0;
+    pane2.replayRawIndex = -1;
+  }
+  dirty2 = true;
+}
 
 function applyChartSettings(c) {
   const clear = 'rgba(0,0,0,0)';
@@ -244,6 +330,7 @@ function createPane2() {
     chart: ch,
     candleSeries: series,
     svgOverlay: svg,
+    baseRawCandles: [],
     rawCandles: [],
     currentDataCache: [],
     shownData: [],
@@ -408,7 +495,8 @@ function toggleSplit() {
     if (pendingPane2State && pane2) {
       const st = pendingPane2State;
       if (Array.isArray(st.pane2Raw) && st.pane2Raw.length) {
-        pane2.rawCandles = ensureAscending(st.pane2Raw);
+        pane2.baseRawCandles = ensureAscending(st.pane2Raw);
+        pane2.rawCandles = applyOffsetToCandles(pane2.baseRawCandles, chartOffsetSec(1));
         pane2.tfCache.clear();
         pane2.symbol = st.pane2Symbol || '';
         pane2.currentTimeframe = st.pane2Tf || '1';
@@ -434,6 +522,7 @@ function toggleSplit() {
     document.getElementById('pane0').style.flex = '';
   }
   refreshPaneIndBadges();
+  refreshOffsetBadges();
 }
 
 // Resizable divider
@@ -715,25 +804,28 @@ function pane2LoadFiles(fileList) {
     r.readAsText(f);
   }));
   Promise.all(readers).then(parts => {
-    let merged = pane2.rawCandles.slice();
+    let merged = (pane2.baseRawCandles || []).slice();
     let sym = pane2.symbol;
     for (const p of parts) {
       const rows = parseNinjaTraderData(p.text);
       merged = mergeCandles(merged, rows);
       if (!sym) sym = symbolFromFileName(p.name);
     }
-    pane2.rawCandles = ensureAscending(merged);
+    pane2.baseRawCandles = ensureAscending(merged);
+    pane2.rawCandles = applyOffsetToCandles(pane2.baseRawCandles, chartOffsetSec(1));
     pane2.rawVer = (pane2.rawVer || 0) + 1;
     pane2.tfCache.clear();
     trackerCache.clear();
     pane2.symbol = sym || pane2.symbol;
-    savePane2RawToDB(pane2.rawCandles).catch(err => console.error('Save pane2Raw failed', err));
+    if (pane2.replayTimestamp == null && replayTimestamp != null) pane2.replayTimestamp = replayTimestamp;
+    savePane2RawToDB(pane2.baseRawCandles).catch(err => console.error('Save pane2Raw failed', err));
     pane2ApplyTf(pane2.currentTimeframe || '1');
     schedulePersist();
   }).catch(err => console.error('Pane2 upload failed', err));
 }
 function pane2ClearData() {
   if (!pane2) return;
+  pane2.baseRawCandles = [];
   pane2.rawCandles = [];
   pane2.rawVer = (pane2.rawVer || 0) + 1;
   pane2.currentDataCache = [];
@@ -941,6 +1033,7 @@ function syncPane2IndCatalog() {
 const _origDrawLoop = null; // patched below after drawLoop exists
 
 // ========== STATE & CACHE ==========
+let baseRawCandles = [];
 let rawCandles = [];
 let currentTimeframe = '1';
 let currentSymbol = '';
@@ -1067,7 +1160,7 @@ async function persistNow() {
       st.put(p2ts != null ? p2ts : null, 'pane2ReplayTs');
       if (p2src) {
         pendingPane2State = {
-          pane2Raw: p2src.rawCandles || [],
+          pane2Raw: p2src.baseRawCandles || [],
           pane2Drawings: p2src.drawings || [],
           pane2Tf: p2src.currentTimeframe || '1',
           pane2Symbol: p2src.symbol || '',
@@ -1173,18 +1266,21 @@ function getSessionAlignedKey(utcSeconds, tf) {
 }
 
 // ========== PARSER & MERGE ==========
-// Accepts NinjaTrader exports ("yyyyMMdd HHmmss;O;H;L;C;V" or "yyyyMMdd;O;H;L;C;V") plus ISO-style dates,
-// ; , or tab delimiters, header rows, CRLF files and decimal commas.
+// Parses raw timestamps exactly as written (zero hardcoded offset, zero auto-DST).
+// Accepts NinjaTrader ("yyyyMMdd HHmmss;O;H;L;C;V"), HistData, ISO/dotted dates, split Date+Time columns,
+// and 13-digit epoch ms (Dukascopy), with ; , or tab delimiters, header rows, CRLF and decimal commas.
+// Any timezone or bar-close (-1m) adjustment is applied manually via Chart settings -> Time offset.
 function parseTimeField(str) {
   const t = String(str).trim();
+  if (/^\d{13}$/.test(t)) return Math.floor(Number(t) / 1000); // epoch milliseconds
   let m = /^(\d{4})(\d{2})(\d{2})$/.exec(t);
   if (m) return `${m[1]}-${m[2]}-${m[3]}`; // daily bar
-  m = /^(\d{4})(\d{2})(\d{2})[ T](\d{2})(\d{2})(\d{2})?/.exec(t);
-  if (m) return Math.floor(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) / 1000) - 60; // NinjaTrader intraday bars are close-stamped; store bar-open time
-  m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/.exec(t);
+  m = /^(\d{4})(\d{2})(\d{2})[ T](\d{2})(\d{2})(\d{2})?$/.exec(t);
+  if (m) return Math.floor(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) / 1000);
+  m = /^(\d{4})[-.](\d{2})[-.](\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?Z?)?$/i.exec(t);
   if (m) {
     if (m[4] === undefined) return `${m[1]}-${m[2]}-${m[3]}`;
-    return Math.floor(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) / 1000) - 60; // NinjaTrader intraday bars are close-stamped; store bar-open time
+    return Math.floor(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) / 1000);
   }
   return null;
 }
@@ -1197,17 +1293,26 @@ function parseNinjaTraderData(text) {
     delim = t.includes(';') ? ';' : t.includes('\t') ? '\t' : t.includes(',') ? ',' : ';';
     break;
   }
-  const num = (v) => +String(v).trim().replace(delim === ';' ? ',' : '', delim === ';' ? '.' : '');
+  const useDecComma = delim === ';';
+  const num = (v) => +(useDecComma ? String(v).trim().replace(',', '.') : String(v).trim());
   const data = [];
   for (let i = 0; i < lines.length; i++) {
-    const parts = lines[i].trim().split(delim);
+    const ln = lines[i].trim();
+    if (!ln) continue;
+    const parts = ln.split(delim);
     if (parts.length < 5) continue;
-    const time = parseTimeField(parts[0]);
+    let time, offIdx = 1;
+    if (parts.length >= 6 && /^\d{2}:\d{2}(?::\d{2})?$/.test(parts[1].trim())) {
+      time = parseTimeField(parts[0].trim() + ' ' + parts[1].trim());
+      offIdx = 2;
+    } else {
+      time = parseTimeField(parts[0]);
+    }
     if (time === null) continue; // header or junk line
-    const open = num(parts[1]), high = num(parts[2]), low = num(parts[3]), close = num(parts[4]);
+    const open = num(parts[offIdx]), high = num(parts[offIdx + 1]), low = num(parts[offIdx + 2]), close = num(parts[offIdx + 3]);
     if (isNaN(open) || isNaN(high) || isNaN(low) || isNaN(close)) continue;
     // repair rows whose high / low do not cover open and close
-    const volume = parts.length > 5 ? (num(parts[5]) || 0) : 0;
+    const volume = parts.length > offIdx + 4 ? (num(parts[offIdx + 4]) || 0) : 0;
     data.push({ time, open, high: Math.max(open, high, low, close), low: Math.min(open, high, low, close), close, volume });
   }
   return data;
@@ -1264,6 +1369,8 @@ function dataSummary() {
 const symbolChip = document.getElementById('symbolChip');
 function symbolFromFileName(name) {
   const base = String(name).replace(/\.[^.]*$/, '');
+  const hd = /^DAT_(?:NT|MT|ASCII)_([A-Za-z0-9]+)_/i.exec(base);
+  if (hd) return hd[1].toUpperCase().slice(0, 8);
   const tok = base.split(/[\s._\-]+/).filter(Boolean)[0] || '';
   const m = /^([A-Za-z]+)\d{2,}$/.exec(tok); // NQ1224 -> NQ
   const sym = (m ? m[1] : tok).toUpperCase();
@@ -4359,7 +4466,19 @@ function chartDialogCanvasHTML() {
     ${row('Scale lines', swBtn('scaleLineColor', 'scaleLineOp'))}
     ${row('Crosshair', swBtn('crossColor', 'crossOp'))}`;
 }
-function openChartDialog() {
+function chartDialogOffsetHTML() {
+  const offCtrls = (hk, mk, pane) => `<div class="cs-off-row">
+    <label class="cs-off-field"><input type="number" class="dlg-num" data-k="${hk}" data-off="1" min="-24" max="24" step="1"><span>h</span></label>
+    <label class="cs-off-field"><input type="number" class="dlg-num" data-k="${mk}" data-off="1" min="-59" max="59" step="1"><span>m</span></label>
+    <button type="button" class="cs-off-zero" data-cs-zero="${pane}" title="Reset to 0">0</button>
+  </div>`;
+  return `<div class="cs-title">Chart 1</div>
+    ${row('Offset <span class="cs-off-total" id="csOffTotal0"></span>', offCtrls('c1OffH', 'c1OffM', 0))}
+    <div class="cs-title" style="margin-top:12px">Chart 2</div>
+    ${row('Offset <span class="cs-off-total" id="csOffTotal1"></span>', offCtrls('c2OffH', 'c2OffM', 1))}
+    <div class="cs-hint" style="margin-top:10px;line-height:1.45">Manual shift applied to each chart's raw file timestamps (no automatic DST or hardcoded bar shift).<br>Examples: <b>0h -1m</b> for NinjaTrader close-stamped bars, <b>+4h 0m</b> or <b>+5h 0m</b> for NY-local CSVs.</div>`;
+}
+function openChartDialog(initialTab = 'candles') {
   closePopup();
   if (dialog.style.display === 'block') closeDialog(false);
   csSnapshot = { ...chartCfg };
@@ -4368,10 +4487,12 @@ function openChartDialog() {
     <div class="dlg-tabs">
       <button type="button" class="dlg-tab" data-cstab="candles">Candles</button>
       <button type="button" class="dlg-tab" data-cstab="canvas">Canvas</button>
+      <button type="button" class="dlg-tab" data-cstab="offset">Time offset</button>
     </div>
     <div class="dlg-body">
       <div class="dlg-pane" data-pane="candles">${chartDialogCandlesHTML()}</div>
       <div class="dlg-pane" data-pane="canvas">${chartDialogCanvasHTML()}</div>
+      <div class="dlg-pane" data-pane="offset">${chartDialogOffsetHTML()}</div>
     </div>
     <div class="dlg-foot">
       <button type="button" class="dlg-btn cs-reset" data-cs="reset">Reset</button>
@@ -4380,7 +4501,7 @@ function openChartDialog() {
     </div>`;
   chartDialog.style.display = 'block';
   if (!chartDialog.style.left) { chartDialog.style.left = `${Math.max(16, window.innerWidth / 2 - 190)}px`; chartDialog.style.top = '90px'; }
-  showChartTab('candles');
+  showChartTab(initialTab);
   syncChartDialog();
   attachDrag(chartDialog, document.getElementById('csHead'));
 }
@@ -4389,8 +4510,17 @@ function showChartTab(k) {
   chartDialog.querySelectorAll('.dlg-pane').forEach(p => { p.style.display = p.dataset.pane === k ? 'block' : 'none'; });
 }
 function closeChartDialog(cancel) {
-  if (cancel && csSnapshot) { chartCfg = { ...csSnapshot }; applyChartSettings(chartCfg); }
-  else saveChartSettings();
+  if (cancel && csSnapshot) {
+    const prev1 = chartOffsetSec(0), prev2 = chartOffsetSec(1);
+    chartCfg = { ...csSnapshot };
+    applyChartSettings(chartCfg);
+    try { if (pane2) applyChartSettingsTo(pane2.chart, pane2.candleSeries, chartCfg); } catch (e) { /* ignore */ }
+    if (chartOffsetSec(0) !== prev1) rebuildChart1FromOffset(true);
+    if (chartOffsetSec(1) !== prev2) rebuildChart2FromOffset(true);
+    refreshOffsetBadges();
+  } else {
+    saveChartSettings();
+  }
   chartDialog.style.display = 'none'; chartDialog.innerHTML = ''; csSnapshot = null; closePopup();
 }
 function syncChartDialog() {
@@ -4407,10 +4537,25 @@ function syncChartDialog() {
   });
   const g2 = chartDialog.querySelector('[data-sw="bgColor2"]');
   if (g2) g2.style.display = chartCfg.bgType === 'gradient' ? '' : 'none';
+  const t0 = document.getElementById('csOffTotal0');
+  if (t0) t0.textContent = chartOffsetSec(0) ? `(${formatOffsetTag(chartOffsetSec(0))})` : '';
+  const t1 = document.getElementById('csOffTotal1');
+  if (t1) t1.textContent = chartOffsetSec(1) ? `(${formatOffsetTag(chartOffsetSec(1))})` : '';
 }
-function commitChartCfg() {
+function commitChartCfg(changedKey = null) {
   applyChartSettings(chartCfg);
   try { if (pane2) applyChartSettingsTo(pane2.chart, pane2.candleSeries, chartCfg); } catch (e) { /* ignore */ }
+  if (changedKey === 'c1OffH' || changedKey === 'c1OffM') {
+    saveChartSettings();
+    rebuildChart1FromOffset(true);
+  } else if (changedKey === 'c2OffH' || changedKey === 'c2OffM') {
+    saveChartSettings();
+    rebuildChart2FromOffset(true);
+  } else if (changedKey === '__allOffsets') {
+    saveChartSettings();
+    rebuildChart1FromOffset(true);
+    rebuildChart2FromOffset(true);
+  }
   syncChartDialog(); dirty = true;
 }
 
@@ -4419,7 +4564,20 @@ chartDialog.addEventListener('click', (e) => {
   if (!t) return;
   if (t.dataset.cs === 'ok') closeChartDialog(false);
   else if (t.dataset.cs === 'cancel') closeChartDialog(true);
-  else if (t.dataset.cs === 'reset') { chartCfg = { ...CHART_DEFAULTS }; commitChartCfg(); }
+  else if (t.dataset.cs === 'reset') {
+    const hadOff = chartOffsetSec(0) !== 0 || chartOffsetSec(1) !== 0;
+    chartCfg = { ...CHART_DEFAULTS };
+    commitChartCfg(hadOff ? '__allOffsets' : null);
+  }
+  else if (t.dataset.csZero !== undefined) {
+    if (t.dataset.csZero === '1') {
+      chartCfg.c2OffH = 0; chartCfg.c2OffM = 0;
+      commitChartCfg('c2OffH');
+    } else {
+      chartCfg.c1OffH = 0; chartCfg.c1OffM = 0;
+      commitChartCfg('c1OffH');
+    }
+  }
   else if (t.dataset.cstab) showChartTab(t.dataset.cstab);
   else if (t.dataset.sw) {
     const ck = t.dataset.sw, ok = t.dataset.op;
@@ -4432,14 +4590,35 @@ function onChartDlgInput(e) {
   const t = e.target, k = t.dataset ? t.dataset.k : null;
   if (!k) return;
   if (t.type === 'checkbox') chartCfg[k] = t.checked;
+  else if (t.dataset.off) {
+    const raw = String(t.value).trim();
+    if (raw === '') {
+      if (e.type !== 'change') return;
+      chartCfg[k] = 0;
+      t.value = '0';
+    } else {
+      let v = parseInt(raw, 10);
+      if (!isFinite(v)) return;
+      const lim = k.endsWith('H') ? 24 : 59;
+      v = Math.max(-lim, Math.min(lim, v));
+      chartCfg[k] = v;
+      if (e.type === 'change') t.value = String(v);
+    }
+  }
   else if (t.dataset.num) { const v = parseFloat(t.value); if (!isFinite(v)) return; chartCfg[k] = v; }
   else chartCfg[k] = t.value;
-  commitChartCfg();
+  commitChartCfg(k);
 }
 chartDialog.addEventListener('input', onChartDlgInput);
 chartDialog.addEventListener('change', onChartDlgInput);
 document.getElementById('chartSettingsBtn').addEventListener('click', () => {
-  if (chartDialog.style.display === 'block') closeChartDialog(false); else openChartDialog();
+  if (chartDialog.style.display === 'block') closeChartDialog(false); else openChartDialog('candles');
+});
+['sbOff', 'pane0OffBtn', 'pane1OffBtn'].forEach(id => {
+  document.getElementById(id)?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openChartDialog('offset');
+  });
 });
 
 // ========== KEYBOARD INTERVAL SWITCHING ==========
@@ -5616,7 +5795,7 @@ fileInput.addEventListener('change', async (e) => {
   fileNameSpan.textContent = `Parsing ${files.length} file(s)...`;
   await new Promise(r => setTimeout(r, 20));
 
-  const hadData = rawCandles.length > 0;
+  const hadData = baseRawCandles.length > 0;
   const parsed = [];
   for (const file of files) {
     parsed.push({ name: file.name, symbol: symbolFromFileName(file.name), candles: parseNinjaTraderData(await file.text()) });
@@ -5627,7 +5806,7 @@ fileInput.addEventListener('change', async (e) => {
   // daily and intraday data cannot share one cache
   const isDaily = (arr) => typeof arr[0].time === 'string';
   const kinds = new Set(valid.map(p => isDaily(p.candles)));
-  if (hadData) kinds.add(isDaily(rawCandles));
+  if (hadData) kinds.add(isDaily(baseRawCandles));
   if (kinds.size > 1) {
     alert('Daily data and intraday data cannot be mixed. Press "Clear cache" first, then upload one kind.');
     restoreLabel(); return;
@@ -5640,7 +5819,7 @@ fileInput.addEventListener('change', async (e) => {
   if (known && syms.some(x => x !== known)) {
     warnings.push(`These files look like different instruments (${[...new Set([known, ...syms])].join(', ')}). Mixing instruments gives wrong candles.`);
   }
-  const refStep = hadData ? barStep(rawCandles) : barStep(valid[0].candles);
+  const refStep = hadData ? barStep(baseRawCandles) : barStep(valid[0].candles);
   const oddSize = valid.filter(p => { const st = barStep(p.candles); return refStep && st && st !== refStep; });
   if (oddSize.length) {
     warnings.push(`Bar size differs from the ${fmtStep(refStep)} data: ${oddSize.map(p => p.name).join(', ')}. Mixing bar sizes gives wrong candles.`);
@@ -5649,10 +5828,11 @@ fileInput.addEventListener('change', async (e) => {
 
   let incoming = [];
   for (const p of valid) incoming = mergeCandles(incoming, p.candles); // upload order does not matter
-  rawCandles = mergeCandles(rawCandles, incoming);
+  baseRawCandles = mergeCandles(baseRawCandles, incoming);
+  rawCandles = applyOffsetToCandles(baseRawCandles, chartOffsetSec(0));
   if (!currentSymbol && syms[0]) setSymbol(syms[0]);
   tfCache.clear(); rawVer++; trackerCache.clear(); indBoxCache.clear();
-  await saveToDB(rawCandles, currentTimeframe);
+  await saveToDB(baseRawCandles, currentTimeframe);
   applyTimeframe(currentTimeframe);
   schedulePersist();
   restoreLabel();
@@ -5665,7 +5845,7 @@ async function clearAllData() {
   persistReady = false; clearTimeout(persistTimer);
   if (dlgShapeId !== null) closeDialog(false);
   await clearDB();
-  rawCandles = []; tfCache.clear(); currentDataCache = []; displayLen = 0;
+  baseRawCandles = []; rawCandles = []; tfCache.clear(); currentDataCache = []; displayLen = 0;
   replayTimestamp = null; replayRawIndex = -1; selectingBarMode = false; drawings = []; toolStyles = {}; posSize = null; nextShapeId = 1; setSymbol('');
   deselect();
   document.getElementById('btn-select-bar').classList.remove('active');
@@ -5698,7 +5878,7 @@ async function clearCandleData() {
   persistReady = false; clearTimeout(persistTimer);
   if (dlgShapeId !== null) closeDialog(false);
   await deleteCandlesFromDB();
-  rawCandles = []; tfCache.clear(); currentDataCache = []; displayLen = 0;
+  baseRawCandles = []; rawCandles = []; tfCache.clear(); currentDataCache = []; displayLen = 0;
   replayTimestamp = null; replayRawIndex = -1; selectingBarMode = false; setSymbol('');
   deselect();
   document.getElementById('btn-select-bar').classList.remove('active');
@@ -6497,44 +6677,13 @@ function trLoop(now) {
 requestAnimationFrame(trLoop);
 
 
-// ========== ONE-TIME INTRADAY TIMESTAMP MIGRATION ==========
-// Older builds persisted NinjaTrader close-stamped minute bars without converting
-// them to bar-open timestamps. Shift stored candles and their time-anchored state
-// back by one minute exactly once; new uploads are normalized in parseTimeField().
-async function migrateCloseStampedTimestamps(st) {
-  if ((st.timestampFixVersion || 0) >= 1) return st;
-  const candles = Array.isArray(st.candles) ? st.candles.map(c =>
-    c && typeof c.time === 'number' ? { ...c, time: c.time - 60 } : c
-  ) : [];
-  const drawings = Array.isArray(st.drawings) ? st.drawings.map(d => {
-    if (!d || typeof d !== 'object') return d;
-    const out = { ...d };
-    for (const k of ['p1', 'p2']) {
-      if (out[k] && typeof out[k].time === 'number') out[k] = { ...out[k], time: out[k].time - 60 };
-    }
-    return out;
-  }) : st.drawings;
-  const replayTs = typeof st.replayTs === 'number' ? st.replayTs - 60 : st.replayTs;
-  const db = await openDB();
-  await new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    const store = tx.objectStore(STORE_NAME);
-    store.put(candles, 'rawCandles');
-    if (drawings !== undefined) store.put(drawings, 'drawings');
-    if (replayTs !== undefined) store.put(replayTs, 'replayTimestamp');
-    store.put(1, 'timestampFixVersion');
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-  return { ...st, candles, drawings, replayTs, timestampFixVersion: 1 };
-}
-
 // ========== INITIALIZE ==========
 async function init() {
   try {
     let st = await loadFromDB();
-    st = await migrateCloseStampedTimestamps(st);
-    rawCandles = ensureAscending(st.candles); currentTimeframe = st.tf;
+    baseRawCandles = ensureAscending(st.candles);
+    rawCandles = applyOffsetToCandles(baseRawCandles, chartOffsetSec(0));
+    currentTimeframe = st.tf;
     setSymbol(st.symbol);
     if (st.posSize && st.posSize.tp > 0 && st.posSize.sl > 0 && st.posSize.bars > 0) posSize = st.posSize;
     if (Array.isArray(st.drawings)) drawings = st.drawings.filter(d => d && d.tool && d.p1 && d.p2).map(ensureVis);
@@ -6567,6 +6716,7 @@ async function init() {
   lastPersistSig = persistSignature();
   persistReady = true;
   try { refreshPaneIndBadges(); } catch (e) { /* ignore */ }
+  try { refreshOffsetBadges(); } catch (e) { /* ignore */ }
   // Force chart to measure its container (prevents blank 0-height canvas)
   requestAnimationFrame(() => {
     try {

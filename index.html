@@ -100,6 +100,7 @@
     <div class="chart-pane active" data-pane="0" id="pane0">
       <div class="pane-chrome">
         <span class="pane-label">Chart 1</span>
+        <button type="button" class="pane-off-btn" id="pane0OffBtn" title="Chart 1 time offset (click to edit)">0m</button>
       </div>
       <div class="chart-container" id="chart"></div>
     </div>
@@ -107,6 +108,7 @@
     <div class="chart-pane" data-pane="1" id="pane1" hidden>
       <div class="pane-chrome">
         <span class="pane-label">Chart 2</span>
+        <button type="button" class="pane-off-btn" id="pane1OffBtn" title="Chart 2 time offset (click to edit)">0m</button>
         <div class="pane-actions">
           <label class="btn btn-primary pane-upload-btn">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 16V4M7 9l5-5 5 5M4 20h16"/></svg>
@@ -126,6 +128,7 @@
   <footer class="statusbar" id="statusBar">
     <div class="sb-left">
       <span class="sb-chip" id="sbTf">1m</span>
+      <button type="button" class="sb-chip sb-off" id="sbOff" title="Chart 1 time offset (click to edit)" hidden></button>
       <span class="sb-chip replay" id="sbReplay" hidden>Replay</span>
       <span id="fileName" class="file-name"></span>
     </div>
