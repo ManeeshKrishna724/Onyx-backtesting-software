@@ -106,8 +106,839 @@ function applyChartSettings(c) {
     wickUpColor: rgba(c.wickUpColor, c.wickUpOp),
     wickDownColor: rgba(c.wickDownColor, c.wickDownOp)
   });
+  // pane2 styled via applyChartSettingsTo from commitChartCfg / toggleSplit (avoid TDZ on load)
 }
 applyChartSettings(chartCfg);
+
+// ========== SPLIT / DUAL PANE ==========
+// Pane 0 = primary (existing globals). Pane 1 = optional side chart.
+let splitOn = false;
+let activePaneId = 0;
+let pane2 = null;
+let pendingPane2State = null; // created lazily on first split
+
+function makeSvgOverlay(parent) {
+  const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  s.setAttribute('id', parent.id === 'chart2' ? 'svg-overlay-2' : 'svg-overlay');
+  s.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:5';
+  parent.appendChild(s);
+  return s;
+}
+
+// ========== SHARED VERTICAL PRICE-SCALE WHEEL ==========
+function attachPriceScaleWheel(container, ch, series, onManual) {
+  container.addEventListener('wheel', (e) => {
+    const r = container.getBoundingClientRect();
+    let pw = r.width, ph = r.height;
+    try {
+      const ps = ch.paneSize();
+      if (ps && ps.width) { pw = ps.width; ph = ps.height; }
+      else { pw = r.width - (ch.priceScale('right').width() || 56); ph = r.height - (ch.timeScale().height() || 26); }
+    } catch (err) {
+      pw = r.width - 56; ph = r.height - 26;
+    }
+    const x = e.clientX - r.left, y = e.clientY - r.top;
+    if (x <= pw || x > r.width || y < 0 || y > ph) return; // only over right price axis
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    const scale = ch.priceScale('right');
+    let range = null;
+    try { range = scale.getVisibleRange(); } catch (err) { /* ignore */ }
+
+    // Fallback when autoScale is active (getVisibleRange returns null)
+    if (!range || !isFinite(range.from) || !isFinite(range.to) || range.to === range.from) {
+      const pTop = series.coordinateToPrice(0);
+      const pBot = series.coordinateToPrice(ph);
+      if (pTop == null || pBot == null || !isFinite(pTop) || !isFinite(pBot) || pTop === pBot) return;
+      range = { from: Math.min(pTop, pBot), to: Math.max(pTop, pBot) };
+    }
+
+    let dy = e.deltaY || e.deltaX;
+    if (e.deltaMode === 1) dy *= 33;
+    else if (e.deltaMode === 2) dy *= 400;
+
+    const span = range.to - range.from;
+    let from, to;
+    if (e.shiftKey) {
+      const shift = (dy / Math.max(ph, 1)) * span;
+      from = range.from + shift;
+      to = range.to + shift;
+    } else {
+      const factor = Math.min(Math.max(Math.exp(dy * 0.0015), 0.5), 2);
+      const mid = (range.from + range.to) / 2;
+      const half = (span / 2) * factor;
+      from = mid - half;
+      to = mid + half;
+    }
+
+    scale.applyOptions({ autoScale: false });
+    scale.setVisibleRange({ from, to });
+    if (onManual) onManual();
+    dirty = true;
+    dirty2 = true;
+  }, { passive: false, capture: true });
+}
+
+function createPane2() {
+  if (pane2) return pane2;
+  const container = document.getElementById('chart2');
+  if (!container) return null;
+  const ch = createChart(container, {
+    layout: { background: { color: '#131722' }, textColor: '#d1d4dc', attributionLogo: false },
+    grid: { vertLines: { color: '#2a2e39' }, horzLines: { color: '#2a2e39' } },
+    crosshair: { mode: 0 },
+    rightPriceScale: { borderColor: '#2a2e39' },
+    handleScale: {
+      mouseWheel: true, pinch: true,
+      axisPressedMouseMove: { time: true, price: true },
+      axisDoubleClickReset: { time: true, price: true }
+    },
+    handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true },
+    kineticScroll: { mouse: false, touch: true },
+    localization: {
+      timeFormatter: (time) => {
+        if (typeof time === 'string') return time;
+        return new Intl.DateTimeFormat('en-US', {
+          timeZone: 'America/New_York', year: 'numeric', month: 'short', day: 'numeric',
+          hour: 'numeric', minute: '2-digit', hour12: true
+        }).format(new Date(time * 1000));
+      }
+    },
+    timeScale: {
+      borderColor: '#2a2e39', timeVisible: true, secondsVisible: false,
+      tickMarkFormatter: (time, tickMarkType) => {
+        if (typeof time === 'string') return time;
+        const d = new Date(time * 1000);
+        const opts = { timeZone: 'America/New_York' };
+        if (tickMarkType === 0) opts.year = 'numeric';
+        else if (tickMarkType === 1) opts.month = 'short';
+        else if (tickMarkType === 2) { opts.month = 'short'; opts.day = 'numeric'; }
+        else { opts.hour = 'numeric'; opts.minute = '2-digit'; opts.hour12 = true; }
+        return new Intl.DateTimeFormat('en-US', opts).format(d);
+      }
+    },
+  });
+  const series = ch.addSeries(CandlestickSeries, {
+    upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
+    wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+  });
+  try { applyChartSettingsTo(ch, series, chartCfg); } catch (e) { /* primary apply still works */ }
+  const svg = makeSvgOverlay(container);
+  new ResizeObserver(entries => {
+    if (!entries.length || !entries[0].contentRect) return;
+    const { width, height } = entries[0].contentRect;
+    ch.applyOptions({ width, height });
+  }).observe(container);
+
+  // Price-scale zoom/scroll on Chart 2 (exact mirror of Chart 1)
+  attachPriceScaleWheel(container, ch, series, () => {
+    const rb = document.getElementById('priceResetBtn2');
+    if (rb) rb.style.background = 'transparent';
+  });
+
+  pane2 = {
+    id: 1,
+    container,
+    chart: ch,
+    candleSeries: series,
+    svgOverlay: svg,
+    rawCandles: [],
+    currentDataCache: [],
+    shownData: [],
+    displayLen: 0,
+    currentTimeframe: '1',
+    replayTimestamp: null,
+    replayRawIndex: -1,
+    drawings: [],
+    nextShapeId: 1,
+    tfCache: new Map(),
+    indInst: [], // independent visibility / instances for this pane
+    indSeries: new Map(),
+    symbol: '',
+    rawVer: 0,
+  };
+  bindPaneDrawingEvents(1, container, svg);
+  // Click pane to make it the active drawing target
+  document.getElementById('pane1').addEventListener('mousedown', () => setActivePane(1), true);
+  document.getElementById('pane0').addEventListener('mousedown', () => setActivePane(0), true);
+
+  // Price-scale reset (R) on chart 2
+  const rBtn = document.createElement('button');
+  rBtn.id = 'priceResetBtn2';
+  rBtn.type = 'button';
+  rBtn.title = 'Reset price scale (auto)';
+  rBtn.textContent = 'R';
+  rBtn.style.cssText = 'position:absolute;z-index:6;width:22px;height:22px;padding:0;border-radius:4px;border:1px solid #363a45;background:#1e222d;color:#d1d4dc;font-size:11px;font-weight:700;font-family:inherit;cursor:pointer;line-height:1;display:grid;place-items:center;';
+  rBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    try {
+      pane2.chart.priceScale('right').applyOptions({ autoScale: true });
+      rBtn.style.background = '#1e222d';
+    } catch (err) { /* ignore */ }
+  });
+  container.appendChild(rBtn);
+  function posR2() {
+    try {
+      const sw = ch.priceScale('right').width() || 56;
+      const th = ch.timeScale().height() || 26;
+      rBtn.style.right = Math.max(2, Math.round((sw - 22) / 2)) + 'px';
+      rBtn.style.bottom = Math.max(2, Math.round((th - 22) / 2)) + 'px';
+    } catch (err) {
+      rBtn.style.right = '18px'; rBtn.style.bottom = '8px';
+    }
+  }
+  new ResizeObserver(posR2).observe(container);
+  posR2();
+
+  // Re-render drawings whenever Chart 2 is panned/zoomed (keeps anchors on candles)
+  try {
+    ch.timeScale().subscribeVisibleLogicalRangeChange(() => {
+      dirty2 = true;
+    });
+  } catch (err) { /* ignore */ }
+
+  // Jump-to-latest on Chart 2
+  const go2 = document.createElement('button');
+  go2.type = 'button';
+  go2.title = 'Jump to current candle';
+  go2.innerHTML = '&#9654;';
+  go2.style.cssText = 'position:absolute;z-index:6;width:26px;height:26px;padding:0;border-radius:4px;border:1px solid #363a45;background:#1e222d;color:#d1d4dc;font-size:12px;font-weight:700;cursor:pointer;display:none;place-items:center;';
+  go2.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (!pane2.shownData.length) return;
+    const n = pane2.shownData.length;
+    try {
+      const lr = ch.timeScale().getVisibleLogicalRange();
+      const bars = lr ? (lr.to - lr.from) : 80;
+      ch.timeScale().setVisibleLogicalRange({ from: Math.max(-0.5, n - bars), to: n - 0.01 });
+    } catch (err) { ch.timeScale().scrollToRealTime(); }
+  });
+  container.appendChild(go2);
+  pane2.goToLatestBtn = go2;
+  function posGo2() {
+    try {
+      const sw = ch.priceScale('right').width() || 56;
+      const th = ch.timeScale().height() || 26;
+      go2.style.right = (sw + 8) + 'px';
+      go2.style.bottom = Math.max(2, Math.round((th - 22) / 2)) + 'px';
+      const lr = ch.timeScale().getVisibleLogicalRange();
+      const n = pane2.shownData.length;
+      const off = lr && n && lr.to < n - 2;
+      go2.style.display = off ? 'grid' : 'none';
+    } catch (err) { go2.style.display = 'none'; }
+  }
+  ch.timeScale().subscribeVisibleLogicalRangeChange(posGo2);
+  new ResizeObserver(posGo2).observe(container);
+
+  return pane2;
+}
+
+function applyChartSettingsTo(ch, series, c) {
+  const clear = 'rgba(0,0,0,0)';
+  const vOn = c.gridMode === 'both' || c.gridMode === 'vert';
+  const hOn = c.gridMode === 'both' || c.gridMode === 'horz';
+  const cross = rgba(c.crossColor, c.crossOp);
+  ch.applyOptions({
+    layout: {
+      background: c.bgType === 'gradient'
+        ? { type: ColorType.VerticalGradient, topColor: rgba(c.bgColor, c.bgOp), bottomColor: rgba(c.bgColor2, c.bgOp2) }
+        : { type: ColorType.Solid, color: rgba(c.bgColor, c.bgOp) },
+      textColor: rgba(c.textColor, c.textOp)
+    },
+    grid: {
+      vertLines: { visible: vOn, color: rgba(c.vGridColor, c.vGridOp), style: Number(c.gridStyle) },
+      horzLines: { visible: hOn, color: rgba(c.hGridColor, c.hGridOp), style: Number(c.gridStyle) }
+    },
+    crosshair: { vertLine: { color: cross }, horzLine: { color: cross } },
+    rightPriceScale: { borderColor: rgba(c.scaleLineColor, c.scaleLineOp) },
+    timeScale: { borderColor: rgba(c.scaleLineColor, c.scaleLineOp) }
+  });
+  series.applyOptions({
+    upColor: c.bodyOn ? rgba(c.upColor, c.upOp) : clear,
+    downColor: c.bodyOn ? rgba(c.downColor, c.downOp) : clear,
+    borderVisible: !!c.borderOn,
+    borderUpColor: rgba(c.borderUpColor, c.borderUpOp),
+    borderDownColor: rgba(c.borderDownColor, c.borderDownOp),
+    wickVisible: !!c.wickOn,
+    wickUpColor: rgba(c.wickUpColor, c.wickUpOp),
+    wickDownColor: rgba(c.wickDownColor, c.wickDownOp)
+  });
+}
+
+function updateClearDrawTitle() {
+  const btn = document.getElementById('btn-clear-draw');
+  if (!btn) return;
+  btn.title = splitOn
+    ? `Remove all drawings (${activePaneId === 1 ? 'Chart 2' : 'Chart 1'})`
+    : 'Remove all drawings';
+}
+
+function setActivePane(id) {
+  if (!splitOn && id === 1) return;
+  activePaneId = id === 1 ? 1 : 0;
+  document.getElementById('pane0')?.classList.toggle('active', activePaneId === 0);
+  document.getElementById('pane1')?.classList.toggle('active', activePaneId === 1);
+  updateClearDrawTitle();
+  try { updateTfButtonsHighlight(); } catch (e) { /* ignore */ }
+  try { refreshPaneChrome(); } catch (e) { /* ignore */ }
+}
+
+function toggleSplit() {
+  splitOn = !splitOn;
+  const shell = document.getElementById('chartShell');
+  const p1 = document.getElementById('pane1');
+  const div = document.getElementById('splitDivider');
+  const btn = document.getElementById('splitBtn');
+  if (splitOn) {
+    createPane2();
+    if (currentDrawTool && pane2) {
+      pane2.container.classList.add('drawing-mode');
+      pane2.container.style.cursor = 'crosshair';
+    }
+    shell?.classList.add('split-on');
+    if (p1) p1.hidden = false;
+    if (div) div.hidden = false;
+    btn?.classList.add('active');
+    document.getElementById('pane0').style.flex = '1 1 0';
+    document.getElementById('pane1').style.flex = '1 1 0';
+    setActivePane(0);
+    // Restore cached Chart 2 data if any
+    if (pendingPane2State && pane2) {
+      const st = pendingPane2State;
+      if (Array.isArray(st.pane2Raw) && st.pane2Raw.length) {
+        pane2.rawCandles = ensureAscending(st.pane2Raw);
+        pane2.tfCache.clear();
+        pane2.symbol = st.pane2Symbol || '';
+        pane2.currentTimeframe = st.pane2Tf || '1';
+        if (typeof st.pane2ReplayTs === 'number') pane2.replayTimestamp = st.pane2ReplayTs;
+        else if (replayTimestamp != null) pane2.replayTimestamp = replayTimestamp;
+        if (Array.isArray(st.pane2Drawings)) pane2.drawings = st.pane2Drawings.filter(d => d && d.p1);
+        pane2ApplyTf(pane2.currentTimeframe, { preserveScale: false });
+      }
+    }
+    requestAnimationFrame(() => {
+      window.dispatchEvent(new Event('resize'));
+      if (pane2) {
+        const r = pane2.container.getBoundingClientRect();
+        pane2.chart.applyOptions({ width: r.width, height: r.height });
+      }
+    });
+  } else {
+    shell?.classList.remove('split-on');
+    if (p1) p1.hidden = true;
+    if (div) div.hidden = true;
+    btn?.classList.remove('active');
+    setActivePane(0);
+    document.getElementById('pane0').style.flex = '';
+  }
+  refreshPaneIndBadges();
+}
+
+// Resizable divider
+(function setupSplitDivider() {
+  const div = document.getElementById('splitDivider');
+  const shell = document.getElementById('chartShell');
+  if (!div || !shell) return;
+  let dragging = false;
+  div.addEventListener('mousedown', (e) => {
+    if (!splitOn) return;
+    dragging = true;
+    div.classList.add('dragging');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const rect = shell.getBoundingClientRect();
+    let ratio = (e.clientX - rect.left) / rect.width;
+    ratio = Math.min(0.8, Math.max(0.2, ratio));
+    const p0 = document.getElementById('pane0');
+    const p1 = document.getElementById('pane1');
+    if (p0) p0.style.flex = ratio + ' 1 0';
+    if (p1) p1.style.flex = (1 - ratio) + ' 1 0';
+  });
+  window.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    div.classList.remove('dragging');
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    window.dispatchEvent(new Event('resize'));
+  });
+})();
+
+document.getElementById('splitBtn')?.addEventListener('click', toggleSplit);
+document.getElementById('pane0')?.addEventListener('mousedown', () => setActivePane(0), true);
+
+
+// ---- Pane 2: upload + apply data ----
+function pane2Resample(tf) {
+  if (!pane2 || !pane2.rawCandles.length) return [];
+  if (pane2.tfCache.has(tf)) return pane2.tfCache.get(tf);
+  // Never swap global rawCandles — that can race with the main chart and freeze the UI
+  const out = resample(pane2.rawCandles, tf, false);
+  pane2.tfCache.set(tf, out);
+  return out;
+}
+function pane2CaptureView() {
+  if (!pane2) return null;
+  try {
+    const lr = pane2.chart.timeScale().getVisibleLogicalRange();
+    if (!lr || !pane2.shownData.length) return null;
+    return { bars: Math.max(20, lr.to - lr.from) };
+  } catch (e) { return null; }
+}
+/** Put the current (last) candle in the horizontal center of Chart 2. */
+function pane2CenterOnLast(barsHint) {
+  if (!pane2 || !pane2.shownData.length) return;
+  try {
+    let bars = barsHint;
+    if (!(bars > 0)) {
+      const lr = pane2.chart.timeScale().getVisibleLogicalRange();
+      bars = lr ? Math.max(20, lr.to - lr.from) : 80;
+    }
+    const last = pane2.shownData.length - 1;
+    const half = bars / 2;
+    const from = last - half;
+    const to = last + half;
+    pane2.chart.timeScale().setVisibleLogicalRange({ from, to });
+  } catch (e) { /* ignore */ }
+}
+function pane2RestoreView(snap) {
+  // On skip we always center the live candle; snap only carries bar-width
+  pane2CenterOnLast(snap && snap.bars);
+}
+function pane2Truncate(data, endT) {
+  if (endT == null || !data.length) return data;
+  // binary upper bound: last index with time <= endT
+  let lo = 0, hi = data.length - 1, ans = -1;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1;
+    if (getComparableTime(data[m].time) <= endT) { ans = m; lo = m + 1; }
+    else hi = m - 1;
+  }
+  if (ans < 0) return data.slice(0, 1);
+  return data.slice(0, ans + 1);
+}
+function pane2ApplyTf(tf, opts = {}) {
+  if (!pane2) return;
+  const preserve = opts.preserveScale !== false;
+  const snap = preserve ? pane2CaptureView() : null;
+  pane2.currentTimeframe = tf;
+  pane2._viewCache = null;
+  pane2Resample(tf); // warm cache
+  const display = pane2BuildSeriesForView(tf);
+  pane2.shownData = display;
+  pane2.displayLen = display.length;
+  if (pane2.replayTimestamp == null) {
+    pane2.replayRawIndex = pane2.rawCandles.length - 1;
+  } else {
+    let lo = 0, hi = pane2.rawCandles.length - 1, ans = -1;
+    while (lo <= hi) {
+      const m = (lo + hi) >> 1;
+      if (getComparableTime(pane2.rawCandles[m].time) <= pane2.replayTimestamp) { ans = m; lo = m + 1; } else hi = m - 1;
+    }
+    pane2.replayRawIndex = ans;
+  }
+  try { pane2.candleSeries.setData(display); } catch (e) { console.error(e); }
+  if (preserve && snap) pane2RestoreView(snap);
+  else if (display.length > 120) {
+    pane2.chart.timeScale().setVisibleLogicalRange({ from: display.length - 120, to: display.length });
+  } else {
+    try { pane2.chart.timeScale().fitContent(); } catch (e) { /* ignore */ }
+  }
+  // Never force autoScale on price — leave whatever the user set
+  dirty2 = true;
+  refreshPaneIndBadges();
+  try { refreshPaneChrome(); } catch (e) { /* ignore */ }
+}
+// Build Chart 2 series with a LIVE forming candle (same idea as buildSeriesForView)
+// so a 15m chart updates OHLC on every shared replay step, not only when a full bucket closes.
+function pane2BuildSeriesForView(tf) {
+  if (!pane2 || !pane2.rawCandles.length) return [];
+  const cached = pane2Resample(tf);
+  const ts = pane2.replayTimestamp;
+  if (ts == null) return cached;
+
+  const raw = pane2.rawCandles;
+  let lo = 0, hi = raw.length - 1, end = -1;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1;
+    if (getComparableTime(raw[m].time) <= ts) { end = m; lo = m + 1; }
+    else hi = m - 1;
+  }
+  if (end < 0) return [];
+
+  const endTime = getComparableTime(raw[end].time);
+  const bucketKey = getSessionAlignedKey(endTime, tf);
+  const bucketTime = getComparableTime(bucketKey);
+
+  // Fast path: reuse previous visible prefix if same TF and same bucket
+  const vc = pane2._viewCache;
+  if (vc && vc.tf === tf && vc.bucketTime === bucketTime && vc.end <= end && Array.isArray(vc.display) && vc.display.length) {
+    const partial = { ...vc.partial };
+    for (let i = vc.end + 1; i <= end; i++) {
+      const c = raw[i];
+      if (c.high > partial.high) partial.high = c.high;
+      if (c.low < partial.low) partial.low = c.low;
+      partial.close = c.close;
+      partial.volume = (partial.volume || 0) + (c.volume || 0);
+    }
+    // Also refresh from rawStart if first time in bucket we skipped - safe rebuild partial from rawStart
+    if (vc.rawStart != null) {
+      let p = null;
+      for (let i = vc.rawStart; i <= end; i++) {
+        const c = raw[i];
+        if (!p) p = { time: bucketKey, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0 };
+        else {
+          if (c.high > p.high) p.high = c.high;
+          if (c.low < p.low) p.low = c.low;
+          p.close = c.close;
+          p.volume += c.volume || 0;
+        }
+      }
+      partial.open = p.open; partial.high = p.high; partial.low = p.low; partial.close = p.close; partial.volume = p.volume; partial.time = bucketKey;
+    }
+    const display = vc.display.slice(0, -1);
+    display.push(partial);
+    pane2._viewCache = { tf, bucketTime, end, rawStart: vc.rawStart, partial, display };
+    return display;
+  }
+
+  lo = 0; hi = end;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const midBucket = getComparableTime(getSessionAlignedKey(getComparableTime(raw[mid].time), tf));
+    if (midBucket < bucketTime) lo = mid + 1;
+    else hi = mid;
+  }
+  const rawStart = lo;
+
+  lo = 0; hi = cached.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (getComparableTime(cached[mid].time) < bucketTime) lo = mid + 1;
+    else hi = mid;
+  }
+  const cachedBucketIndex = lo;
+
+  let partial = null;
+  for (let i = rawStart; i <= end; i++) {
+    const c = raw[i];
+    if (!partial) {
+      partial = { time: bucketKey, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume || 0 };
+    } else {
+      if (c.high > partial.high) partial.high = c.high;
+      if (c.low < partial.low) partial.low = c.low;
+      partial.close = c.close;
+      partial.volume += c.volume || 0;
+    }
+  }
+  const visible = cached.slice(0, cachedBucketIndex);
+  if (partial) visible.push(partial);
+  pane2._viewCache = { tf, bucketTime, end, rawStart, partial: partial ? { ...partial } : null, display: visible };
+  return visible;
+}
+
+
+function pane2AdvanceReplay(ts) {
+  if (!splitOn || !pane2 || !pane2.rawCandles.length) return;
+  const prevTs = pane2.replayTimestamp;
+  pane2.replayTimestamp = ts;
+  const tf = pane2.currentTimeframe || '1';
+  const raw = pane2.rawCandles;
+
+  // Fast O(1) incremental forward path (no full-array slice/copy on every skip)
+  if (prevTs != null && ts >= prevTs && pane2.replayRawIndex >= 0 && pane2.shownData.length) {
+    let i = pane2.replayRawIndex + 1;
+    let changed = false;
+    let lastUpdated = null;
+    const is1m = String(tf) === '1';
+
+    while (i < raw.length) {
+      const rt = getComparableTime(raw[i].time);
+      if (rt > ts) break;
+      const r = raw[i];
+      const bucket = is1m ? rt : getSessionAlignedKey(rt, tf);
+      const bucketComp = getComparableTime(bucket);
+      const last = pane2.shownData[pane2.shownData.length - 1];
+      if (last && getComparableTime(last.time) === bucketComp) {
+        if (r.high > last.high) last.high = r.high;
+        if (r.low < last.low) last.low = r.low;
+        last.close = r.close;
+        last.volume = (last.volume || 0) + (r.volume || 0);
+        lastUpdated = last;
+      } else {
+        if (lastUpdated) { try { pane2.candleSeries.update(lastUpdated); } catch (e) { /* ignore */ } }
+        const nb = { time: bucket, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume || 0 };
+        pane2.shownData.push(nb);
+        appendCtCache(pane2.shownData, bucket);
+        lastUpdated = nb;
+      }
+      pane2.replayRawIndex = i;
+      changed = true;
+      i++;
+    }
+    if (changed && lastUpdated) {
+      pane2.displayLen = pane2.shownData.length;
+      try { pane2.candleSeries.update(lastUpdated); } catch (e) { /* ignore */ }
+      if (pane2.drawings.length) dirty2 = true;
+    }
+    return;
+  }
+
+  // Fallback for rewind / jump / initial enter
+  pane2._viewCache = null;
+  const display = pane2BuildSeriesForView(tf);
+  if (!display.length) return;
+  pane2.shownData = display;
+  pane2.displayLen = display.length;
+  let lo = 0, hi = raw.length - 1, ans = -1;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1;
+    if (getComparableTime(raw[m].time) <= ts) { ans = m; lo = m + 1; } else hi = m - 1;
+  }
+  pane2.replayRawIndex = ans;
+  try { pane2.candleSeries.setData(display); } catch (e) { console.error(e); }
+  if (pane2.drawings.length) dirty2 = true;
+}
+
+function pane2LoadFiles(fileList) {
+  if (!pane2 || !fileList?.length) return;
+  const readers = [...fileList].map(f => new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res({ name: f.name, text: r.result });
+    r.onerror = rej;
+    r.readAsText(f);
+  }));
+  Promise.all(readers).then(parts => {
+    let merged = pane2.rawCandles.slice();
+    let sym = pane2.symbol;
+    for (const p of parts) {
+      const rows = parseNinjaTraderData(p.text);
+      merged = mergeCandles(merged, rows);
+      if (!sym) sym = symbolFromFileName(p.name);
+    }
+    pane2.rawCandles = ensureAscending(merged);
+    pane2.rawVer = (pane2.rawVer || 0) + 1;
+    pane2.tfCache.clear();
+    trackerCache.clear();
+    pane2.symbol = sym || pane2.symbol;
+    savePane2RawToDB(pane2.rawCandles).catch(err => console.error('Save pane2Raw failed', err));
+    pane2ApplyTf(pane2.currentTimeframe || '1');
+    schedulePersist();
+  }).catch(err => console.error('Pane2 upload failed', err));
+}
+function pane2ClearData() {
+  if (!pane2) return;
+  pane2.rawCandles = [];
+  pane2.rawVer = (pane2.rawVer || 0) + 1;
+  pane2.currentDataCache = [];
+  pane2.shownData = [];
+  pane2.displayLen = 0;
+  pane2.replayRawIndex = -1;
+  pane2.tfCache.clear();
+  trackerCache.clear();
+  pane2.drawings = [];
+  pane2.replayTimestamp = null;
+  pane2.symbol = '';
+  if (selectedPane2Id !== null) deselect();
+  try { pane2.candleSeries.setData([]); } catch (e) { /* ignore */ }
+  savePane2RawToDB([]).catch(() => {});
+  schedulePersist();
+  dirty2 = true;
+}
+document.getElementById('clearPane2Btn')?.addEventListener('click', () => {
+  if (!pane2) return;
+  if (!confirm('Clear all data and drawings on Chart 2?')) return;
+  pane2ClearData();
+});
+document.getElementById('fileInput2')?.addEventListener('change', (e) => {
+  pane2LoadFiles(e.target.files);
+  e.target.value = '';
+});
+
+// Time + candle-skip are ALWAYS shared across panes.
+// Scroll position and timeframe are ALWAYS independent.
+// Sync button = one-shot: jump Chart 2's visible window to Chart 1's current time range.
+function findIdxAtOrBefore(data, t) {
+  if (!data || !data.length || t == null) return -1;
+  let lo = 0, hi = data.length - 1, ans = -1;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1;
+    const mt = getComparableTime(data[m].time);
+    if (mt <= t) { ans = m; lo = m + 1; } else hi = m - 1;
+  }
+  return ans;
+}
+function jumpPane2ToPrimaryTimeWindow() {
+  if (!pane2 || !splitOn || !shownData.length || !pane2.shownData.length) return;
+  try {
+    const lr = chart.timeScale().getVisibleLogicalRange();
+    if (!lr) return;
+    const fromIdx = Math.max(0, Math.min(shownData.length - 1, Math.floor(lr.from)));
+    const toIdx = Math.max(0, Math.min(shownData.length - 1, Math.ceil(lr.to)));
+    const t0 = getComparableTime(shownData[fromIdx].time);
+    const t1 = getComparableTime(shownData[toIdx].time);
+    // Match shared replay cursor
+    if (replayTimestamp != null) pane2.replayTimestamp = replayTimestamp;
+    pane2ApplyTf(pane2.currentTimeframe);
+    let i0 = findIdxAtOrBefore(pane2.shownData, t0);
+    let i1 = findIdxAtOrBefore(pane2.shownData, t1);
+    if (i0 < 0) i0 = 0;
+    if (i1 < 0) i1 = pane2.shownData.length - 1;
+    if (i1 <= i0) i1 = Math.min(pane2.shownData.length - 1, i0 + 10);
+    pane2.chart.timeScale().setVisibleLogicalRange({ from: i0, to: i1 + 0.01 });
+  } catch (e) { /* ignore */ }
+}
+
+
+function refreshPaneChrome() {
+  const fmt = (tf) => {
+    if (!tf) return '';
+    if (tf === '1D' || tf === '1W') return tf;
+    const n = parseInt(tf, 10);
+    if (!n) return String(tf);
+    if (n >= 60 && n % 60 === 0) return (n / 60) + 'h';
+    return n + 'm';
+  };
+  const l0 = document.querySelector('#pane0 .pane-label');
+  const l1 = document.querySelector('#pane1 .pane-label');
+  if (l0) l0.textContent = 'Chart 1 · ' + fmt(currentTimeframe);
+  if (l1) l1.textContent = 'Chart 2 · ' + fmt(pane2 ? pane2.currentTimeframe : '1');
+}
+
+function updateTfButtonsHighlight() {
+  const tf = (splitOn && activePaneId === 1 && pane2)
+    ? pane2.currentTimeframe
+    : currentTimeframe;
+  document.querySelectorAll('.timeframes button').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.tf === tf);
+  });
+}
+
+// ---- Pane 2 selection state (uses shared drawing engine) ----
+let selectedPane2Id = null;
+let dirty2 = true;
+
+// ---- Per-pane indicator badge menu ----
+function paneIndList(paneId) {
+  // Pane 0 uses global indInst; pane 1 uses pane2.indInst (visibility clones)
+  if (paneId === 1) {
+    if (!pane2) return [];
+    // Ensure pane2 has entries mirroring primary library instances (by uid)
+    return pane2.indInst;
+  }
+  return indInst;
+}
+function refreshPaneIndBadges() {
+  for (const id of [0, 1]) {
+    const badge = document.querySelector(`[data-pane-ind="${id}"]`);
+    if (!badge) continue;
+    const wrap = badge.closest('.pane-ind-wrap');
+    if (!wrap) continue;
+    if (id === 1 && !splitOn) { wrap.style.visibility = 'hidden'; continue; }
+    wrap.style.visibility = '';
+    const list = paneIndList(id);
+    const n = list.filter(i => i && i.visible !== false).length;
+    const num = badge.querySelector('.pane-ind-num');
+    if (num) num.textContent = String(n);
+  }
+}
+function renderPaneIndMenu(paneId) {
+  const menu = document.querySelector(`[data-pane-menu="${paneId}"]`);
+  if (!menu) return;
+  const list = paneIndList(paneId);
+  if (!list.length) {
+    menu.innerHTML = '<div class="pim-empty">No indicators on this chart</div>';
+    return;
+  }
+  menu.innerHTML = list.map(inst => {
+    const rec = indDefs.get(inst.libId);
+    const name = (rec && rec.def && rec.def.name) || inst.libId || 'Indicator';
+    const on = inst.visible !== false;
+    return `<div class="pim-row" data-uid="${inst.uid}">
+      <span class="pim-name">${escHtml(name)}</span>
+      <button type="button" class="pim-ico ${on ? '' : 'off'}" data-pim="eye" title="Show / hide">${IC.eye}</button>
+      <button type="button" class="pim-ico" data-pim="gear" title="Settings">${IC.gear}</button>
+    </div>`;
+  }).join('');
+}
+function togglePaneIndMenu(paneId) {
+  const menu = document.querySelector(`[data-pane-menu="${paneId}"]`);
+  const badge = document.querySelector(`[data-pane-ind="${paneId}"]`);
+  if (!menu || !badge) return;
+  const open = menu.hidden;
+  document.querySelectorAll('.pane-ind-menu').forEach(m => { m.hidden = true; });
+  document.querySelectorAll('.pane-ind-badge').forEach(b => b.classList.remove('open'));
+  if (open) {
+    renderPaneIndMenu(paneId);
+    menu.hidden = false;
+    badge.classList.add('open');
+  }
+}
+document.addEventListener('click', (e) => {
+  const badge = e.target.closest('[data-pane-ind]');
+  if (badge) {
+    e.stopPropagation();
+    togglePaneIndMenu(+badge.dataset.paneInd);
+    return;
+  }
+  const eye = e.target.closest('[data-pim="eye"]');
+  if (eye) {
+    e.stopPropagation();
+    const row = eye.closest('.pim-row');
+    const menu = eye.closest('.pane-ind-menu');
+    const paneId = menu ? +menu.dataset.paneMenu : 0;
+    const uid = row?.dataset.uid;
+    const list = paneIndList(paneId);
+    const inst = list.find(i => i.uid === uid);
+    if (inst) {
+      inst.visible = !inst.visible;
+      eye.classList.toggle('off', inst.visible === false);
+      if (paneId === 0) {
+        saveIndicators();
+        syncIndicators(true);
+      } else {
+        // pane2: mirror visibility onto a local copy; primary sync still drives series on pane0
+        // For pane2 we only gate drawing of boxes if we later add indicator render there.
+        refreshPaneIndBadges();
+      }
+      refreshPaneIndBadges();
+    }
+    return;
+  }
+  const gear = e.target.closest('[data-pim="gear"]');
+  if (gear) {
+    e.stopPropagation();
+    const row = gear.closest('.pim-row');
+    const uid = row?.dataset.uid;
+    if (uid && typeof openIndDialog === 'function') openIndDialog(uid);
+    document.querySelectorAll('.pane-ind-menu').forEach(m => { m.hidden = true; });
+    return;
+  }
+  if (!e.target.closest('.pane-ind-wrap')) {
+    document.querySelectorAll('.pane-ind-menu').forEach(m => { m.hidden = true; });
+    document.querySelectorAll('.pane-ind-badge').forEach(b => b.classList.remove('open'));
+  }
+});
+
+// When primary indicators change, keep pane2.indInst list in sync (visibility independent)
+function syncPane2IndCatalog() {
+  if (!pane2) return;
+  const byUid = new Map(pane2.indInst.map(i => [i.uid, i]));
+  pane2.indInst = indInst.map(i => {
+    const prev = byUid.get(i.uid);
+    return prev ? prev : { ...JSON.parse(JSON.stringify(i)), visible: i.visible !== false };
+  });
+  refreshPaneIndBadges();
+}
+
+// Hook: after drawings render on primary, also refresh pane2 overlay
+const _origDrawLoop = null; // patched below after drawLoop exists
 
 // ========== STATE & CACHE ==========
 let rawCandles = [];
@@ -155,6 +986,16 @@ async function saveCurrentTfToDB(tf) {
   });
 }
 
+async function savePane2RawToDB(candles) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).put(candles || [], 'pane2Raw');
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 async function loadFromDB() {
   const db = await openDB();
   return new Promise((resolve, reject) => {
@@ -163,12 +1004,17 @@ async function loadFromDB() {
     const reqs = {
       candles: store.get('rawCandles'), tf: store.get('currentTf'), drawings: store.get('drawings'),
       toolStyles: store.get('toolStyles'), replayTs: store.get('replayTimestamp'), nextShapeId: store.get('nextShapeId'),
-      posSize: store.get('posSize'), symbol: store.get('symbol'), timestampFixVersion: store.get('timestampFixVersion')
+      posSize: store.get('posSize'), symbol: store.get('symbol'), timestampFixVersion: store.get('timestampFixVersion'),
+      pane2Raw: store.get('pane2Raw'), pane2Drawings: store.get('pane2Drawings'), pane2Tf: store.get('pane2Tf'),
+      pane2Symbol: store.get('pane2Symbol'), pane2ReplayTs: store.get('pane2ReplayTs')
     };
     tx.oncomplete = () => resolve({
       candles: reqs.candles.result || [], tf: reqs.tf.result || '1', drawings: reqs.drawings.result,
       toolStyles: reqs.toolStyles.result, replayTs: reqs.replayTs.result, nextShapeId: reqs.nextShapeId.result,
-      posSize: reqs.posSize.result, symbol: reqs.symbol.result, timestampFixVersion: reqs.timestampFixVersion.result || 0
+      posSize: reqs.posSize.result, symbol: reqs.symbol.result, timestampFixVersion: reqs.timestampFixVersion.result || 0,
+      pane2Raw: reqs.pane2Raw.result || [], pane2Drawings: reqs.pane2Drawings.result || [],
+      pane2Tf: reqs.pane2Tf.result || '1', pane2Symbol: reqs.pane2Symbol.result || '',
+      pane2ReplayTs: reqs.pane2ReplayTs.result
     });
     tx.onerror = () => reject(tx.error);
   });
@@ -186,7 +1032,11 @@ async function clearDB() {
 
 // Drawings, tool styles and the replay position are auto-saved (debounced) whenever they change.
 let persistReady = false, persistTimer = null, lastPersistSig = '';
-function persistSignature() { return JSON.stringify([drawings, toolStyles, replayTimestamp, nextShapeId, posSize, currentSymbol]); }
+function persistSignature() {
+  const p2d = pane2 ? pane2.drawings : (pendingPane2State ? pendingPane2State.pane2Drawings : []);
+  const p2tf = pane2 ? pane2.currentTimeframe : (pendingPane2State ? pendingPane2State.pane2Tf : '1');
+  return JSON.stringify([drawings, p2d, p2tf, toolStyles, replayTimestamp, nextShapeId, posSize, currentSymbol]);
+}
 function schedulePersist() {
   if (!persistReady) return;
   clearTimeout(persistTimer);
@@ -207,6 +1057,23 @@ async function persistNow() {
       st.put(nextShapeId, 'nextShapeId');
       st.put(posSize, 'posSize');
       st.put(currentSymbol, 'symbol');
+      // Persist lightweight Chart 2 metadata & drawings only (pane2Raw is saved exclusively on upload/clear)
+      const p2src = pane2 || null;
+      const p2pend = pendingPane2State || {};
+      st.put((p2src && p2src.drawings) || p2pend.pane2Drawings || [], 'pane2Drawings');
+      st.put((p2src && p2src.currentTimeframe) || p2pend.pane2Tf || '1', 'pane2Tf');
+      st.put((p2src && p2src.symbol) || p2pend.pane2Symbol || '', 'pane2Symbol');
+      const p2ts = p2src ? p2src.replayTimestamp : p2pend.pane2ReplayTs;
+      st.put(p2ts != null ? p2ts : null, 'pane2ReplayTs');
+      if (p2src) {
+        pendingPane2State = {
+          pane2Raw: p2src.rawCandles || [],
+          pane2Drawings: p2src.drawings || [],
+          pane2Tf: p2src.currentTimeframe || '1',
+          pane2Symbol: p2src.symbol || '',
+          pane2ReplayTs: p2src.replayTimestamp
+        };
+      }
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
@@ -240,14 +1107,48 @@ function getNYTimeDetails(timestampUTC) {
 
 const _sessKeyCache = new Map(); // `${tf}|${utc}` -> key
 const SESS_KEY_CACHE_MAX = 30000;
+const _nyDayOffsetCache = new Map(); // utcDay -> constant NY offsetSec, or null on DST change days
+function _calcNYOffsetSec(utcSec) {
+  const ny = getNYTimeDetails(utcSec);
+  return Math.floor(Date.UTC(ny.year, ny.month - 1, ny.day, ny.hour, ny.minute, ny.second) / 1000) - (utcSec | 0);
+}
+function getFastNYOffset(utcSec) {
+  const day = Math.floor(utcSec / 86400);
+  let off = _nyDayOffsetCache.get(day);
+  if (off !== undefined) return off;
+  const o0 = _calcNYOffsetSec(day * 86400);
+  const o1 = _calcNYOffsetSec(day * 86400 + 86399);
+  off = (o0 === o1) ? o0 : null;
+  _nyDayOffsetCache.set(day, off);
+  return off;
+}
 function getSessionAlignedKey(utcSeconds, tf) {
-  const ck = tf + '|' + (utcSeconds | 0);
+  const sec = utcSeconds | 0;
+  const off = getFastNYOffset(sec);
+  if (off !== null) {
+    const shiftedSec = sec + off + 21600; // +6h so 18:00 NY -> 00:00
+    if (tf === '1D') {
+      const d = new Date(shiftedSec * 1000);
+      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+    }
+    if (tf === '1W') {
+      const d = new Date(shiftedSec * 1000);
+      const dow = d.getUTCDay();
+      d.setUTCDate(d.getUTCDate() - dow + (dow === 0 ? -6 : 1));
+      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+    }
+    const intervalSec = (parseInt(tf, 10) || 1) * 60;
+    return Math.floor(shiftedSec / intervalSec) * intervalSec - off - 21600;
+  }
+
+  // Exact Intl fallback on the 2 DST transition days per year
+  const ck = tf + '|' + sec;
   let hit = _sessKeyCache.get(ck);
   if (hit !== undefined) return hit;
 
-  const ny = getNYTimeDetails(utcSeconds);
+  const ny = getNYTimeDetails(sec);
   const nyMathTime = Date.UTC(ny.year, ny.month - 1, ny.day, ny.hour, ny.minute, ny.second);
-  const shiftedTime = nyMathTime + (6 * 3600 * 1000);
+  const shiftedTime = nyMathTime + 21600000;
   const shiftedDate = new Date(shiftedTime);
   let key;
 
@@ -263,8 +1164,8 @@ function getSessionAlignedKey(utcSeconds, tf) {
     const shiftedSec = Math.floor(shiftedTime / 1000);
     const bucketShifted = Math.floor(shiftedSec / intervalSec) * intervalSec;
     const nyAsUtcSec = Math.floor(nyMathTime / 1000);
-    const offset = nyAsUtcSec - utcSeconds;
-    key = bucketShifted - offset - 6 * 3600;
+    const offset = nyAsUtcSec - sec;
+    key = bucketShifted - offset - 21600;
   }
   if (_sessKeyCache.size >= SESS_KEY_CACHE_MAX) _sessKeyCache.clear();
   _sessKeyCache.set(ck, key);
@@ -783,12 +1684,6 @@ function stepReplay(steps) {
   }
   if (targetIdx === cur) return;
 
-  // Keep ctArr in sync without rebuilding the whole array on every step
-  const ensureCtAppend = (t) => {
-    if (ctRef === shownData && Array.isArray(ctArr)) ctArr.push(getComparableTime(t));
-    else ctRef = null; // force rebuild next time someone needs full ctimes
-  };
-
   // Backward stepping rebuilds the visible aggregate safely.
   if (targetIdx < cur) {
     replayRawIndex = targetIdx;
@@ -797,20 +1692,19 @@ function stepReplay(steps) {
     candleSeries.setData(rebuilt);
     shownData = rebuilt;
     displayLen = rebuilt.length;
-    ctRef = null;
   } else if (isOneMinute) {
-    // Fast path: 1m only — push + single LWC update per new bar, no session keys
+    // Fast path: 1m only — push + O(1) cache append + single LWC update per new bar
     for (let i = cur + 1; i <= targetIdx; i++) {
       const raw = rawCandles[i];
       const rawTime = getComparableTime(raw.time);
       const next = { time: rawTime, open: raw.open, high: raw.high, low: raw.low, close: raw.close, volume: raw.volume || 0 };
       shownData.push(next);
-      ensureCtAppend(rawTime);
+      appendCtCache(shownData, rawTime);
       candleSeries.update(next);
     }
     displayLen = shownData.length;
   } else {
-    // Higher TF forward: aggregate into the forming bucket
+    // Higher TF forward: aggregate into forming bucket and flush each completed candle
     let next = null;
     for (let i = cur + 1; i <= targetIdx; i++) {
       const raw = rawCandles[i];
@@ -819,18 +1713,19 @@ function stepReplay(steps) {
       const last = shownData[shownData.length - 1];
       const lastTime = last ? getComparableTime(last.time) : null;
       if (last && lastTime === getComparableTime(bucketTime)) {
-        last.high = Math.max(last.high, raw.high);
-        last.low = Math.min(last.low, raw.low);
+        if (raw.high > last.high) last.high = raw.high;
+        if (raw.low < last.low) last.low = raw.low;
         last.close = raw.close;
         last.volume = (last.volume || 0) + (raw.volume || 0);
         next = last;
       } else {
+        if (next) candleSeries.update(next);
         next = { time: bucketTime, open: raw.open, high: raw.high, low: raw.low, close: raw.close, volume: raw.volume || 0 };
         shownData.push(next);
-        ensureCtAppend(bucketTime);
+        appendCtCache(shownData, bucketTime);
       }
     }
-    if (next) candleSeries.update(next); // one LWC call for the whole step
+    if (next) candleSeries.update(next);
     displayLen = shownData.length;
   }
 
@@ -846,6 +1741,10 @@ function stepReplay(steps) {
   // Defer go-to-latest visibility work
   if (typeof scheduleGoToLatest === 'function') scheduleGoToLatest();
   else updateGoToLatestBtn();
+  // Shared current-time cursor on pane2 (forward + rewind) — sync so it never lags
+  if (splitOn && pane2 && pane2.rawCandles.length) {
+    try { pane2AdvanceReplay(replayTimestamp); } catch (e) { console.error('pane2 advance', e); }
+  }
 }
 
 
@@ -857,6 +1756,10 @@ document.getElementById('btn-exit-replay').addEventListener('click', () => {
   document.getElementById('btn-select-bar').classList.remove('active');
   chartContainer.style.cursor = 'default';
   applyTimeframe(currentTimeframe);
+  if (pane2) {
+    pane2.replayTimestamp = null;
+    try { pane2ApplyTf(pane2.currentTimeframe); } catch (e) { /* ignore */ }
+  }
 });
 
 // ========== GO TO SESSION ==========
@@ -1057,7 +1960,27 @@ function applyTemplate(s, name) {
 }
 
 const clone = (o) => JSON.parse(JSON.stringify(o));
-const findShape = (id) => drawings.find(d => d.id === id);
+const findShape = (id) => {
+  if (id == null) return null;
+  // Prefer Chart 2 when that selection is active (avoids id confusion)
+  if (selectedPane2Id != null && selectedPane2Id === id && pane2) {
+    const p2 = pane2.drawings.find(d => d && d.id === id);
+    if (p2) return p2;
+  }
+  const a = drawings.find(d => d && d.id === id);
+  if (a) return a;
+  return (pane2 && pane2.drawings.find(d => d && d.id === id)) || null;
+};
+function removeDrawing(id) {
+  if (pane2 && pane2.drawings.some(d => d && d.id === id)) {
+    pane2.drawings = pane2.drawings.filter(d => d.id !== id);
+    selectedPane2Id = null;
+    dirty2 = true;
+    return;
+  }
+  drawings = drawings.filter(d => d.id !== id);
+  dirty = true;
+}
 function ensureVis(d) {
   if (!d.vis || typeof d.vis !== 'object') d.vis = { min: true, hour: true, day: true, week: true };
   else {
@@ -1074,6 +1997,23 @@ function ensureVis(d) {
 }
 const isPosTool = (t) => t === 'long' || t === 'short';
 function redrawDrawings() { dirty = true; }
+// Which pane the current draw gesture belongs to (set on mousedown)
+let drawTargetPane = 0;
+function addDrawing(shape) {
+  // Global unique IDs so Chart 1 and Chart 2 never collide
+  if (!shape.id) shape.id = nextShapeId++;
+  if (drawTargetPane === 1 && pane2) {
+    pane2.drawings.push(shape);
+    selectedPane2Id = shape.id;
+    selectedShapeId = shape.id;
+    dirty = true;
+    try { refreshFloating(); } catch (e) { /* ignore */ }
+    schedulePersist();
+    return;
+  }
+  drawings.push(shape);
+  dirty = true;
+}
 
 // ---------- generic helpers ----------
 function rgba(hex, a = 1) {
@@ -1099,21 +2039,86 @@ function mk(tag, attrs, parent) {
 }
 
 // ---------- time <-> x mapping (works in the future / past of the data too) ----------
-function isDailyTf() { return currentTimeframe === '1D' || currentTimeframe === '1W'; }
+function isDailyTf() { const tf = dTf(); return tf === '1D' || tf === '1W'; }
 function barSeconds() {
-  if (currentTimeframe === '1D') return 86400;
-  if (currentTimeframe === '1W') return 604800;
-  return (parseInt(currentTimeframe, 10) || 1) * 60;
+  const tf = dTf();
+  if (tf === '1D') return 86400;
+  if (tf === '1W') return 604800;
+  return (parseInt(tf, 10) || 1) * 60;
 }
 let ctRef = null, ctArr = [];
+const _ctCache = new WeakMap();
+function appendCtCache(src, timeVal) {
+  const arr = _ctCache.get(src);
+  if (arr && arr.length === src.length - 1) arr.push(getComparableTime(timeVal));
+}
+// ---- Shared draw context (Chart 1 + Chart 2 use the same engine) ----
+let _drawPaneId = 0;
+let _drawChart = null;
+let _drawSeries = null;
+let _drawContainer = null;
+let _drawSvg = null;
+let _drawList = null;   // array ref
+let _drawShown = null;  // array ref
+let _drawTf = null;
+let _drawClipId = 'paneClip';
+function dPaneId() { return _drawPaneId; }
+function dChart() { return _drawChart || chart; }
+function dSeries() { return _drawSeries || candleSeries; }
+function dContainer() { return _drawContainer || chartContainer; }
+function dSvg() { return _drawSvg || svgOverlay; }
+function dDrawings() { return _drawList || drawings; }
+function dShown() { return _drawShown || shownData || currentDataCache; }
+function dTf() { return _drawTf || currentTimeframe; }
+function dRawCandles() { return (_drawPaneId === 1 && pane2) ? pane2.rawCandles : rawCandles; }
+function dReplayTs() { return (_drawPaneId === 1 && pane2) ? pane2.replayTimestamp : replayTimestamp; }
+function dReplayRawIdx() { return (_drawPaneId === 1 && pane2) ? pane2.replayRawIndex : replayRawIndex; }
+function dRawVer() { return (_drawPaneId === 1 && pane2) ? (pane2.rawVer || 0) : rawVer; }
+function setDrawCtx(ctx) {
+  _drawPaneId = ctx.paneId || 0;
+  _drawChart = ctx.chart;
+  _drawSeries = ctx.series;
+  _drawContainer = ctx.container;
+  _drawSvg = ctx.svg;
+  _drawList = ctx.list;
+  _drawShown = ctx.shown;
+  _drawTf = ctx.tf;
+  _drawClipId = ctx.clipId || 'paneClip';
+}
+function setDrawCtxPrimary() {
+  setDrawCtx({
+    paneId: 0, chart, series: candleSeries, container: chartContainer, svg: svgOverlay,
+    list: drawings, shown: shownData, tf: currentTimeframe, clipId: 'paneClip'
+  });
+}
+function setDrawCtxPane2() {
+  if (!pane2) return false;
+  setDrawCtx({
+    paneId: 1, chart: pane2.chart, series: pane2.candleSeries, container: pane2.container, svg: pane2.svgOverlay,
+    list: pane2.drawings, shown: pane2.shownData, tf: pane2.currentTimeframe || '1', clipId: 'paneClip2'
+  });
+  return true;
+}
+function setDrawCtxForPane(paneId) {
+  if (paneId === 1 && pane2) return setDrawCtxPane2();
+  setDrawCtxPrimary();
+  return true;
+}
+function paneOfShape(id) {
+  if (pane2 && pane2.drawings.some(d => d && d.id === id)) return 1;
+  return 0;
+}
+
 function ctimes() {
-  // Must match whatever is currently on the chart series (shownData), not the full cache
-  const src = (shownData && shownData.length) ? shownData : currentDataCache;
-  if (ctRef !== src) {
-    ctRef = src;
-    ctArr = src.map(c => getComparableTime(c.time));
+  // O(1) WeakMap cache per pane series — eliminates per-frame array rebuilds in split screen
+  const src = dShown();
+  if (!src || !src.length) return [];
+  let arr = _ctCache.get(src);
+  if (!arr || arr.length !== src.length) {
+    arr = src.map(c => getComparableTime(c.time));
+    _ctCache.set(src, arr);
   }
-  return ctArr;
+  return arr;
 }
 function timeToLogical(t) {
   const a = ctimes(), n = a.length;
@@ -1126,7 +2131,7 @@ function timeToLogical(t) {
   // timeframe candle that contains it. Do not return fractional indexes:
   // those place an anchor between candle centres and distort drawings after
   // changing timeframe (especially when bars are missing or sessions have gaps).
-  const bucket = getComparableTime(getSessionAlignedKey(t, currentTimeframe));
+  const bucket = getComparableTime(getSessionAlignedKey(t, dTf()));
   if (bucket == null || !isFinite(bucket)) return null;
 
   // Lower-bound search for the bucket timestamp in the exact series currently
@@ -1166,30 +2171,30 @@ function timeToX(t) {
   const l = timeToLogical(t);
   if (l === null) return null;
   try {
-    const x = chart.timeScale().logicalToCoordinate(l);
+    const x = dChart().timeScale().logicalToCoordinate(l);
     if (x !== null && isFinite(x)) return x;
     // Outside the current visible window — still return a coordinate so drawings stay drawable
-    const lr = chart.timeScale().getVisibleLogicalRange();
+    const lr = dChart().timeScale().getVisibleLogicalRange();
     if (!lr) return null;
     const clamped = Math.min(Math.max(l, lr.from - 50), lr.to + 50);
-    return chart.timeScale().logicalToCoordinate(clamped);
+    return dChart().timeScale().logicalToCoordinate(clamped);
   } catch (e) { return null; }
 }
 function xToTime(x) {
-  const l = chart.timeScale().coordinateToLogical(x);
+  const l = dChart().timeScale().coordinateToLogical(x);
   if (l === null) return null;
   return logicalToTime(Math.round(l)); // snaps to bars like TradingView
 }
 function pxToData(x, y) {
   const t = xToTime(x);
-  const p = candleSeries.coordinateToPrice(y);
+  const p = dSeries().coordinateToPrice(y);
   if (t === null || p === null) return null;
   return { time: t, price: p };
 }
 function dataToPx(pt) {
   if (!pt) return null;
   let x = timeToX(pt.time);
-  let y = candleSeries.priceToCoordinate(pt.price);
+  let y = dSeries().priceToCoordinate(pt.price);
 
   // If time is slightly outside the series, snap to nearest bar time
   if ((x === null || !isFinite(x)) && pt.time != null) {
@@ -1210,7 +2215,7 @@ function dataToPx(pt) {
   // If price is outside the current scale, extrapolate from the visible range
   if ((y === null || !isFinite(y)) && pt.price != null && isFinite(pt.price)) {
     try {
-      const r = chart.priceScale('right').getVisibleRange();
+      const r = dChart().priceScale('right').getVisibleRange();
       const ph = paneSize().h;
       if (r && isFinite(r.from) && isFinite(r.to) && r.to !== r.from && ph > 0) {
         y = (1 - (pt.price - r.from) / (r.to - r.from)) * ph;
@@ -1222,27 +2227,24 @@ function dataToPx(pt) {
   return { x, y };
 }
 function paneSize() {
-  try { const s = chart.paneSize(); if (s && s.width) return { w: s.width, h: s.height }; } catch (e) { /* fall through */ }
+  try { const s = dChart().paneSize(); if (s && s.width) return { w: s.width, h: s.height }; } catch (e) { /* fall through */ }
+  const cont = dContainer();
+  const ch = dChart();
   return {
-    w: chartContainer.clientWidth - chart.priceScale('right').width(),
-    h: chartContainer.clientHeight - chart.timeScale().height()
+    w: cont.clientWidth - ch.priceScale('right').width(),
+    h: cont.clientHeight - ch.timeScale().height()
   };
 }
 function tfCategory() {
-  if (currentTimeframe === '1D') return 'day';
-  if (currentTimeframe === '1W') return 'week';
-  return (parseInt(currentTimeframe, 10) < 60) ? 'min' : 'hour';
+  const tf = dTf();
+  if (tf === '1D') return 'day';
+  if (tf === '1W') return 'week';
+  return (parseInt(tf, 10) < 60) ? 'min' : 'hour';
 }
 function lastShownClose() {
-  const a = ctimes();
-  if (!a.length) return null;
-  let idx = a.length - 1;
-  if (replayTimestamp !== null) {
-    let lo = 0, hi = a.length - 1, r = -1;
-    while (lo <= hi) { const m = (lo + hi) >> 1; if (a[m] <= replayTimestamp) { r = m; lo = m + 1; } else hi = m - 1; }
-    if (r >= 0) idx = r;
-  }
-  return currentDataCache[idx].close;
+  const src = dShown();
+  if (!src || !src.length) return null;
+  return src[src.length - 1].close;
 }
 
 // ---------- time formatting / parsing (New York time like the rest of the app) ----------
@@ -1335,9 +2337,9 @@ function makeShape(tool, p1, p2) {
 // Only the width in bars is remembered from the previous position.
 function currentPosSize() {
   let span = 0;
-  try { const r = chart.priceScale('right').getVisibleRange(); if (r && r.to > r.from) span = r.to - r.from; } catch (e) { /* ignore */ }
+  try { const r = dChart().priceScale('right').getVisibleRange(); if (r && r.to > r.from) span = r.to - r.from; } catch (e) { /* ignore */ }
   const q = (v) => Math.max(TICK_SIZE, Math.round(v / TICK_SIZE) * TICK_SIZE);
-  const lr = chart.timeScale().getVisibleLogicalRange();
+  const lr = dChart().timeScale().getVisibleLogicalRange();
   const risk = q((span || 40) * 0.08); // equal distance for TP and SL
   const bars = (posSize && posSize.bars > 0)
     ? posSize.bars
@@ -1390,47 +2392,62 @@ function positionBoxEndTime(s) {
   return t0 + Math.max(60, (s.widthBars || 12) * barSeconds());
 }
 function getTracker(s) {
-  if (!rawCandles.length) return null;
+  const raw = dRawCandles();
+  if (!raw || !raw.length) return null;
   const long = s.tool === 'long', entry = s.p1.price, tp = s.tpPrice, sl = s.slPrice;
   const t0 = getComparableTime(s.p1.time);
   if (t0 == null) return null;
   const boxEndT = positionBoxEndTime(s);
   if (boxEndT == null) return null;
 
-  // Only raw candles inside the tool's time span (and not hidden by replay)
-  let endIdx = visibleRawEnd();
+  const rTs = dReplayTs();
+  let endIdx = raw.length;
+  if (rTs !== null && rTs !== undefined) {
+    const rIdx = dReplayRawIdx();
+    if (rIdx >= 0 && rIdx < raw.length) {
+      const rt = getComparableTime(raw[rIdx].time);
+      if (rt != null && rt <= rTs && (rt + 59) >= rTs) endIdx = rIdx + 1;
+      else {
+        let lo = 0, hi = raw.length;
+        while (lo < hi) { const m = (lo + hi) >> 1; if (getComparableTime(raw[m].time) <= rTs) lo = m + 1; else hi = m; }
+        endIdx = lo;
+      }
+    } else {
+      let lo = 0, hi = raw.length;
+      while (lo < hi) { const m = (lo + hi) >> 1; if (getComparableTime(raw[m].time) <= rTs) lo = m + 1; else hi = m; }
+      endIdx = lo;
+    }
+  }
   {
-    let lo = 0, hi = rawCandles.length;
+    let lo = 0, hi = raw.length;
     while (lo < hi) {
       const m = (lo + hi) >> 1;
-      if (getComparableTime(rawCandles[m].time) <= boxEndT) lo = m + 1;
+      if (getComparableTime(raw[m].time) <= boxEndT) lo = m + 1;
       else hi = m;
     }
     endIdx = Math.min(endIdx, lo);
   }
-  // Entry is filled at the tool's left edge (placement time) — do NOT wait for a later
-  // touch of the entry price. Waiting caused the first TP/SL tap to be skipped.
-  const entryIdx = Math.min(rawLowerBound(t0), Math.max(0, endIdx - 1));
+  let eLo = 0, eHi = raw.length;
+  while (eLo < eHi) { const m = (eLo + eHi) >> 1; if (getComparableTime(raw[m].time) < t0) eLo = m + 1; else eHi = m; }
+  const entryIdx = Math.min(eLo, Math.max(0, endIdx - 1));
   if (entryIdx < 0 || entryIdx >= endIdx) return null;
 
-  const base = `${rawVer}|${t0}|${entry}|${tp}|${sl}|${boxEndT}|v2`;
-  let st = trackerCache.get(s.id);
+  const cacheKey = `${dPaneId()}|${s.id}`;
+  const base = `${dRawVer()}|${t0}|${entry}|${tp}|${sl}|${boxEndT}|v2`;
+  let st = trackerCache.get(cacheKey);
   if (!st || st.base !== base || endIdx < st.scanned) {
     st = { base, scanned: entryIdx, entryIdx, exitIdx: -1, outcome: null };
-    trackerCache.set(s.id, st);
+    trackerCache.set(cacheKey, st);
   }
 
-  // Scan forward from entry for the FIRST candle that touches TP or SL
   if (!st.outcome) {
     let i = st.scanned;
     for (; i < endIdx; i++) {
-      const c = rawCandles[i];
+      const c = raw[i];
       const tpHit = long ? c.high >= tp : c.low <= tp;
       const slHit = long ? c.low <= sl : c.high >= sl;
       if (!tpHit && !slHit) continue;
       if (tpHit && slHit) {
-        // Both in one bar: use candle direction as a simple intrabar order
-        // (up-close → low first, down-close → high first)
         const lowFirst = c.close >= c.open;
         st.outcome = long ? (lowFirst ? 'sl' : 'tp') : (lowFirst ? 'tp' : 'sl');
       } else {
@@ -1443,15 +2460,14 @@ function getTracker(s) {
     st.scanned = i;
   }
 
-  const lastIdx = st.outcome ? st.exitIdx : Math.min(endIdx, rawCandles.length) - 1;
+  const lastIdx = st.outcome ? st.exitIdx : Math.min(endIdx, raw.length) - 1;
   if (lastIdx < st.entryIdx) return null;
-  const endCandle = rawCandles[lastIdx];
+  const endCandle = raw[lastIdx];
   let lastPrice = endCandle.close;
-  // Pin path end exactly on TP/SL when closed so the line stops on the level
   if (st.outcome === 'tp') lastPrice = tp;
   else if (st.outcome === 'sl') lastPrice = sl;
   return {
-    entryT: getComparableTime(rawCandles[st.entryIdx].time),
+    entryT: getComparableTime(raw[st.entryIdx].time),
     endT: getComparableTime(endCandle.time),
     boxEndT,
     outcome: st.outcome,
@@ -1626,14 +2642,19 @@ function refreshFloating() {
   ftButtons.innerHTML = h;
   editToolbar.classList.add('active');
   attachDrag(editToolbar, document.getElementById('ftGrip'));
+  if (selectedPane2Id != null) dirty2 = true;
 }
 function cloneShape(s) {
+  const pId = paneOfShape(s.id);
+  setDrawCtxForPane(pId);
+  drawTargetPane = pId;
   const c = clone(s);
   c.id = nextShapeId++;
   const dB = 3;
   ['p1', 'p2'].forEach(k => { const l = timeToLogical(c[k].time); if (l !== null) c[k].time = logicalToTime(l + dB); });
-  drawings.push(c);
+  addDrawing(c);
   selectShape(c.id);
+  if (pId === 1) { selectedPane2Id = c.id; dirty2 = true; }
 }
 function colourTarget(s, act) {
   if (s.tool === 'line' || s.tool === 'hline' || s.tool === 'hray' || s.tool === 'vline') return act === 'stroke' ? ['color', 'opacity'] : ['textColor', 'textOpacity'];
@@ -1646,10 +2667,13 @@ ftButtons.addEventListener('click', (e) => {
   const btn = e.target.closest('[data-act]');
   const s = findShape(selectedShapeId);
   if (!btn || !s) return;
+  const _wasP2 = selectedPane2Id != null && selectedPane2Id === selectedShapeId;
+  const _p2Redraw = () => { if (_wasP2 || (pane2 && pane2.drawings.some(d => d.id === s.id))) dirty2 = true; };
+
   const act = btn.dataset.act;
   if (act === 'settings') { closePopup(); openDialog(s, null); return; }
   if (act === 'text' && (s.tool === 'line' || s.tool === 'hline' || s.tool === 'hray' || s.tool === 'vline' || s.tool === 'rect' || s.tool === 'note')) { closePopup(); openDialog(s, 'text'); return; }
-  if (act === 'delete') { pushUndo('delete drawing'); closePopup(); drawings = drawings.filter(d => d.id !== s.id); deselect(); return; }
+  if (act === 'delete') { pushUndo('delete drawing'); closePopup(); removeDrawing(s.id); deselect(); return; }
   if (act === 'lock') { s.locked = !s.locked; refreshFloating(); dirty = true; return; }
   if (act === 'stroke' && s.tool === 'fib') {
     openColorPicker(btn, () => ({ color: s.oneColorValue, opacity: 1 }), (c) => {
@@ -1688,8 +2712,18 @@ ftButtons.addEventListener('click', (e) => {
       { value: 'back', html: '<span>Send to back</span>' }
     ], null, (v) => {
       if (v === 'clone') cloneShape(s);
-      if (v === 'front') { drawings = drawings.filter(d => d.id !== s.id); drawings.push(s); }
-      if (v === 'back') { drawings = drawings.filter(d => d.id !== s.id); drawings.unshift(s); }
+      if (v === 'front' || v === 'back') {
+        const onP2 = pane2 && pane2.drawings.some(d => d && d.id === s.id);
+        if (onP2) {
+          pane2.drawings = pane2.drawings.filter(d => d.id !== s.id);
+          if (v === 'front') pane2.drawings.push(s); else pane2.drawings.unshift(s);
+          dirty2 = true;
+        } else {
+          drawings = drawings.filter(d => d.id !== s.id);
+          if (v === 'front') drawings.push(s); else drawings.unshift(s);
+          dirty = true;
+        }
+      }
       dirty = true;
     }, 'menu-text');
   }
@@ -1799,34 +2833,51 @@ function openTemplateMenu(anchor, s) {
   openPopup(anchor, wrap);
 }
 
-// Dragging a floating panel by its grip
-function attachDrag(panel, grip) {
-  if (!grip || grip._bound) return;
+// Dragging a floating panel by its grip (optionally strictly bounded inside boundsEl)
+function clampPanelToBounds(panel, boundsEl) {
+  if (!panel || !boundsEl || panel.style.position !== 'absolute') return;
+  const pad = 4;
+  const maxL = Math.max(pad, boundsEl.clientWidth - panel.offsetWidth - pad);
+  const maxT = Math.max(pad, boundsEl.clientHeight - panel.offsetHeight - pad);
+  const curL = parseFloat(panel.style.left);
+  const curT = parseFloat(panel.style.top);
+  if (isFinite(curL)) panel.style.left = `${Math.min(Math.max(pad, curL), maxL)}px`;
+  if (isFinite(curT)) panel.style.top = `${Math.min(Math.max(pad, curT), maxT)}px`;
+}
+function attachDrag(panel, grip, boundsEl = null) {
+  if (!panel || !grip || grip._bound) return;
   grip._bound = true;
+  if (boundsEl) {
+    new ResizeObserver(() => clampPanelToBounds(panel, boundsEl)).observe(boundsEl);
+  }
   grip.addEventListener('mousedown', (e) => {
     e.preventDefault(); e.stopPropagation();
     const r = panel.getBoundingClientRect();
-    // Pin size + clear opposing anchors so flex/transform don't stretch the bar while dragging
-    panel.style.position = 'fixed';
-    panel.style.left = `${r.left}px`;
-    panel.style.top = `${r.top}px`;
+    const br = boundsEl ? boundsEl.getBoundingClientRect() : null;
+    panel.style.position = boundsEl ? 'absolute' : 'fixed';
+    const l0 = br ? (r.left - br.left) : r.left;
+    const t0 = br ? (r.top - br.top) : r.top;
+    panel.style.left = `${l0}px`;
+    panel.style.top = `${t0}px`;
     panel.style.right = 'auto';
     panel.style.bottom = 'auto';
     panel.style.width = `${r.width}px`;
     panel.style.height = `${r.height}px`;
     panel.style.transform = 'none';
     panel.style.margin = '0';
-    const sx = e.clientX, sy = e.clientY, l0 = r.left, t0 = r.top;
+    const sx = e.clientX, sy = e.clientY;
     const mv = (ev) => {
-      const maxL = Math.max(0, window.innerWidth - panel.offsetWidth);
-      const maxT = Math.max(0, window.innerHeight - panel.offsetHeight);
-      panel.style.left = `${Math.min(Math.max(0, l0 + ev.clientX - sx), maxL)}px`;
-      panel.style.top = `${Math.min(Math.max(0, t0 + ev.clientY - sy), maxT)}px`;
+      const limW = boundsEl ? boundsEl.clientWidth : window.innerWidth;
+      const limH = boundsEl ? boundsEl.clientHeight : window.innerHeight;
+      const pad = boundsEl ? 4 : 0;
+      const maxL = Math.max(pad, limW - panel.offsetWidth - pad);
+      const maxT = Math.max(pad, limH - panel.offsetHeight - pad);
+      panel.style.left = `${Math.min(Math.max(pad, l0 + ev.clientX - sx), maxL)}px`;
+      panel.style.top = `${Math.min(Math.max(pad, t0 + ev.clientY - sy), maxT)}px`;
     };
     const up = () => {
       document.removeEventListener('mousemove', mv);
       document.removeEventListener('mouseup', up);
-      // Drop fixed width/height so orientation toggle can reflow naturally
       panel.style.width = '';
       panel.style.height = '';
     };
@@ -1834,12 +2885,16 @@ function attachDrag(panel, grip) {
     document.addEventListener('mouseup', up);
   });
 }
-attachDrag(drawToolbar, document.getElementById('dtGrip'));
 
 // ---------- selection ----------
 function selectShape(id) { selectedShapeId = id; refreshFloating(); dirty = true; }
 function deselect() {
-  selectedShapeId = null; closePopup(); editToolbar.classList.remove('active'); dirty = true;
+  selectedShapeId = null;
+  selectedPane2Id = null;
+  closePopup();
+  editToolbar.classList.remove('active');
+  dirty = true;
+  dirty2 = true;
 }
 
 // ---------- settings dialog ----------
@@ -1960,6 +3015,10 @@ function closeDialog(cancel) {
   if (cancel && dlgSnapshot) {
     const i = drawings.findIndex(d => d.id === dlgShapeId);
     if (i >= 0) drawings[i] = dlgSnapshot;
+    else if (pane2) {
+      const j = pane2.drawings.findIndex(d => d.id === dlgShapeId);
+      if (j >= 0) { pane2.drawings[j] = dlgSnapshot; dirty2 = true; }
+    }
     if (dlgPrevStyles) toolStyles = dlgPrevStyles;
     posSize = dlgPrevPos;
     refreshFloating();
@@ -2044,44 +3103,96 @@ function onDlgInput(e) {
 dialog.addEventListener('input', onDlgInput);
 dialog.addEventListener('change', onDlgInput);
 
-// ---------- top drawing toolbar ----------
+// ---------- single shared floating drawing toolbar (works on Chart 1 & Chart 2) ----------
 function toggleDrawTool(tool) {
   drawClicks = []; activePreview = null; creating = null;
-  document.querySelectorAll('.draw-btn').forEach(b => b.classList.remove('active'));
-  if (currentDrawTool === tool) {
-    currentDrawTool = null;
-    chartContainer.style.cursor = 'default';
-  } else {
-    const btn = document.querySelector(`.draw-btn[data-tool="${tool}"]`);
-    if (btn) btn.classList.add('active');
-    currentDrawTool = tool;
-    deselect();
-    chartContainer.style.cursor = 'crosshair';
-  }
-  chartContainer.classList.toggle('drawing-mode', !!currentDrawTool);
-  dirty = true;
-}
-document.querySelectorAll('.draw-btn[data-tool]').forEach(btn => {
-  btn.addEventListener('click', () => toggleDrawTool(btn.dataset.tool));
-});
-document.getElementById('btn-clear-draw').addEventListener('click', () => {
-  if (drawings.length) pushUndo('clear drawings');
-  drawings = []; deselect(); if (dlgShapeId !== null) closeDialog(false); dirty = true;
-});
+  document.querySelectorAll('#drawToolbar .draw-btn[data-tool]').forEach(b => b.classList.remove('active'));
 
-// Vertical ↔ horizontal drawing toolbar
-(function setupToolbarOrientation() {
+  if (currentDrawTool === tool) {
+    stopTool();
+    return;
+  }
+
+  currentDrawTool = tool;
+  deselect();
+
+  document.querySelector(`#drawToolbar .draw-btn[data-tool="${tool}"]`)?.classList.add('active');
+
+  // Arm both panes so you can draw directly on whichever chart you click
+  chartContainer.classList.add('drawing-mode');
+  chartContainer.style.cursor = 'crosshair';
+  if (pane2) {
+    pane2.container.classList.add('drawing-mode');
+    pane2.container.style.cursor = 'crosshair';
+  }
+  dirty = true;
+  if (pane2) dirty2 = true;
+}
+
+function stopTool() {
+  currentDrawTool = null; drawClicks = []; activePreview = null; creating = null;
+  document.querySelectorAll('#drawToolbar .draw-btn[data-tool]').forEach(b => b.classList.remove('active'));
+  chartContainer.style.cursor = 'default';
+  chartContainer.classList.remove('drawing-mode');
+  if (pane2) {
+    pane2.container.style.cursor = 'default';
+    pane2.container.classList.remove('drawing-mode');
+  }
+}
+
+(function setupDrawingToolbar() {
   const bar = document.getElementById('drawToolbar');
+  const grip = document.getElementById('dtGrip');
+  const clearBtn = document.getElementById('btn-clear-draw');
+  const orientBtn = document.getElementById('btn-toolbar-orient');
   if (!bar) return;
+
+  // Prevent toolbar clicks from triggering chart pan/draw
+  bar.addEventListener('mousedown', (e) => e.stopPropagation());
+  attachDrag(bar, grip);
+
+  bar.querySelectorAll('.draw-btn[data-tool]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleDrawTool(btn.dataset.tool);
+    });
+  });
+
+  if (clearBtn) {
+    clearBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      // In split screen, clears the currently active chart (Chart 1 or Chart 2)
+      if (splitOn && activePaneId === 1 && pane2) {
+        if (pane2.drawings.length) pushUndo('clear chart 2 drawings');
+        if (dlgShapeId !== null && paneOfShape(dlgShapeId) === 1) closeDialog(false);
+        pane2.drawings = [];
+        if (selectedPane2Id !== null) deselect();
+        dirty2 = true;
+        schedulePersist();
+        try { trToast('Cleared Chart 2 drawings'); } catch (err) { /* ignore */ }
+      } else {
+        if (drawings.length) pushUndo('clear chart 1 drawings');
+        if (dlgShapeId !== null && paneOfShape(dlgShapeId) === 0) closeDialog(false);
+        drawings = [];
+        if (selectedShapeId !== null && selectedPane2Id === null) deselect();
+        dirty = true;
+        schedulePersist();
+        if (splitOn) { try { trToast('Cleared Chart 1 drawings'); } catch (err) { /* ignore */ } }
+      }
+    });
+  }
+
   const KEY = 'onyx-toolbar-orient';
-  function apply(orient) {
-    bar.classList.toggle('horizontal', orient === 'horizontal');
-    // Reset any drag-fixed geometry so CSS orientation rules take over cleanly
+  let orient = 'vertical';
+  try { orient = localStorage.getItem(KEY) === 'horizontal' ? 'horizontal' : 'vertical'; } catch (e) { /* ignore */ }
+
+  function applyOrient(o) {
+    bar.classList.toggle('horizontal', o === 'horizontal');
+    bar.style.position = 'fixed';
     bar.style.width = '';
     bar.style.height = '';
     bar.style.right = 'auto';
-    bar.style.bottom = 'auto';
-    if (orient === 'horizontal') {
+    if (o === 'horizontal') {
       bar.style.left = '50%';
       bar.style.top = 'auto';
       bar.style.bottom = '48px';
@@ -2092,28 +3203,19 @@ document.getElementById('btn-clear-draw').addEventListener('click', () => {
       bar.style.bottom = 'auto';
       bar.style.transform = 'translateY(-50%)';
     }
-    try { localStorage.setItem(KEY, orient); } catch (e) { /* ignore */ }
-    const btn = document.getElementById('btn-toolbar-orient');
-    if (btn) btn.title = orient === 'horizontal' ? 'Switch to vertical toolbar' : 'Switch to horizontal toolbar';
+    try { localStorage.setItem(KEY, o); } catch (e) { /* ignore */ }
+    if (orientBtn) orientBtn.title = o === 'horizontal' ? 'Switch to vertical toolbar' : 'Switch to horizontal toolbar';
   }
-  let orient = 'vertical';
-  try { orient = localStorage.getItem(KEY) === 'horizontal' ? 'horizontal' : 'vertical'; } catch (e) { /* ignore */ }
-  apply(orient);
-  const btn = document.getElementById('btn-toolbar-orient');
-  if (btn) {
-    btn.addEventListener('click', () => {
+  applyOrient(orient);
+  if (orientBtn) {
+    orientBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
       orient = orient === 'horizontal' ? 'vertical' : 'horizontal';
-      apply(orient);
+      applyOrient(orient);
     });
   }
+  updateClearDrawTitle();
 })();
-
-function stopTool() {
-  currentDrawTool = null; drawClicks = []; activePreview = null; creating = null;
-  document.querySelectorAll('.draw-btn').forEach(b => b.classList.remove('active'));
-  chartContainer.style.cursor = 'default';
-  chartContainer.classList.remove('drawing-mode');
-}
 
 // ---------- keyboard ----------
 document.addEventListener('keydown', (e) => {
@@ -2133,7 +3235,18 @@ document.addEventListener('keydown', (e) => {
   }
   if ((e.key === 'Delete' || e.key === 'Backspace') && !typing && selectedShapeId !== null) {
     const s = findShape(selectedShapeId);
-    if (s && !s.locked) { pushUndo('delete drawing'); drawings = drawings.filter(d => d.id !== s.id); deselect(); dirty = true; }
+    if (s && !s.locked) {
+      pushUndo('delete drawing');
+      if (pane2 && pane2.drawings.some(d => d.id === selectedShapeId)) {
+        pane2.drawings = pane2.drawings.filter(d => d.id !== selectedShapeId);
+        selectedPane2Id = null;
+        deselect();
+        dirty2 = true;
+      } else {
+        removeDrawing(s.id);
+        deselect(); dirty = true;
+      }
+    }
   }
 });
 document.addEventListener('keyup', (e) => { if (e.key === 'Shift') { isShiftDown = false; dirty = true; } });
@@ -2142,79 +3255,17 @@ document.addEventListener('keyup', (e) => { if (e.key === 'Shift') { isShiftDown
 function finishShape(s) {
   pushUndo('draw ' + (s.tool || 'shape'));
   if (isPosTool(s.tool)) rememberPosSize(s);
-  rememberStyle(s); // carry colours / note text / sizes into the next drawing of this tool
-  drawings.push(s);
+  rememberStyle(s);
+  addDrawing(s);
   stopTool();
   selectShape(s.id);
+  if (drawTargetPane === 1) selectedPane2Id = s.id;
 }
 function finishTwoPoint(pt) {
   const p1 = drawClicks[0];
   const p2pt = { time: pt.time, price: (isShiftDown && currentDrawTool === 'line') ? p1.price : pt.price };
   finishShape(makeShape(currentDrawTool, p1, p2pt));
 }
-chartContainer.addEventListener('mousedown', (e) => {
-  if (!currentDrawTool || e.button !== 0) return;
-  if (e.target.closest('.dt-toolbar, #editToolbar')) return;
-  const r = chartContainer.getBoundingClientRect();
-  const x = e.clientX - r.left, y = e.clientY - r.top, ps = paneSize();
-  if (x < 0 || y < 0 || x > ps.w || y > ps.h) return;
-  const pt = pxToData(x, y);
-  if (!pt) return;
-  e.stopPropagation(); e.preventDefault();
-  if (isPosTool(currentDrawTool)) {
-    const sh = makeShape(currentDrawTool, pt, { time: pt.time, price: pt.price });
-    sh.p2 = posP2(sh);
-    finishShape(sh);
-    return;
-  }
-  if (isAxisTool(currentDrawTool)) {
-    // One-click tools: hline / hray / vline
-    const sh = makeShape(currentDrawTool, pt, { time: pt.time, price: pt.price });
-    finishShape(sh);
-    return;
-  }
-  if (drawClicks.length === 0) {
-    drawClicks = [pt]; creating = { sx: e.clientX, sy: e.clientY }; activePreview = null; dirty = true;
-  } else {
-    finishTwoPoint(pt);
-  }
-}, true);
-
-// ---------- selecting / dragging existing shapes ----------
-svgOverlay.addEventListener('mousedown', (e) => {
-  if (e.button !== 0 || currentDrawTool) return;
-  const t = e.target;
-  const sid = parseInt(t.getAttribute('data-sid'), 10);
-  if (!sid) return;
-  const s = findShape(sid);
-  if (!s) return;
-  e.stopPropagation(); e.preventDefault();
-  closePopup();
-  if (selectedShapeId !== sid) selectShape(sid);
-  if (s.locked) return;
-  dragState = { sid, h: t.getAttribute('data-h') || null, sx: e.clientX, sy: e.clientY, orig: clone(s) };
-});
-svgOverlay.addEventListener('click', (e) => e.stopPropagation());
-svgOverlay.addEventListener('dblclick', (e) => {
-  const sid = parseInt(e.target.getAttribute('data-sid'), 10);
-  const s = sid ? findShape(sid) : null;
-  if (!s) return;
-  if (s.tool === 'note') { startNoteInlineEdit(s); return; }
-  openDialog(s, null);
-});
-
-// Click note body to edit text when already selected and the pointer did not drag
-svgOverlay.addEventListener('click', (e) => {
-  if (!e.target.getAttribute('data-note-edit')) return;
-  const sid = parseInt(e.target.getAttribute('data-note-edit'), 10);
-  const s = findShape(sid);
-  if (!s || s.tool !== 'note' || selectedShapeId !== sid) return;
-  // If a drag just finished, dragState was cleared on mouseup — use a short move threshold flag
-  if (window._noteDidDrag) { window._noteDidDrag = false; return; }
-  e.stopPropagation();
-  startNoteInlineEdit(s);
-});
-
 let noteEditEl = null;
 function endNoteInlineEdit(commit) {
   if (!noteEditEl) return;
@@ -2256,7 +3307,7 @@ function startNoteInlineEdit(s) {
   ta.style.color = s.textColor || '#fff';
   ta.style.background = rgba(s.bgColor || '#1e222d', s.bgOpacity != null ? s.bgOpacity : 0.95);
   ta.style.borderColor = rgba(s.borderColor || '#363a45', 1);
-  chartContainer.appendChild(ta);
+  dContainer().appendChild(ta);
   noteEditEl = ta;
   ta.focus();
   ta.select();
@@ -2272,13 +3323,14 @@ function startNoteInlineEdit(s) {
 }
 
 function moveShape(s, orig, dx, dy) {
-  const ts = chart.timeScale();
+  const ts = dChart().timeScale();
+  const ser = dSeries();
   const l0 = timeToLogical(orig.p1.time);
   const x0 = ts.logicalToCoordinate(l0);
-  const y0 = candleSeries.priceToCoordinate(orig.p1.price);
+  const y0 = ser.priceToCoordinate(orig.p1.price);
   if (l0 === null || x0 === null || y0 === null) return;
   const l1 = ts.coordinateToLogical(x0 + dx);
-  const pr = candleSeries.coordinateToPrice(y0 + dy);
+  const pr = ser.coordinateToPrice(y0 + dy);
   if (l1 === null || pr === null) return;
   const dB = Math.round(l1 - l0), dP = pr - orig.p1.price;
   if (s.tool === 'hline' || s.tool === 'hray') {
@@ -2333,53 +3385,161 @@ function setHandle(s, h, time, price) {
     }
   }
 }
+
+// ---------- unified per-pane drawing & dragging engine (identical on Chart 1 & Chart 2) ----------
+function bindPaneDrawingEvents(paneId, container, svg) {
+  let downPos = null;
+
+  container.addEventListener('mousedown', (e) => {
+    downPos = { x: e.clientX, y: e.clientY };
+    if (!currentDrawTool || e.button !== 0) return;
+    if (e.target.closest('.dt-toolbar, #editToolbar, .pane-chrome, .pane-ind-menu, .tr-plus, .tr-menu, #priceResetBtn, #priceResetBtn2, #goToLatestBtn')) return;
+    // If the user started a 2-point drawing on the other chart and clicks here, start fresh on this chart
+    if (drawClicks.length > 0 && drawTargetPane !== paneId) {
+      drawClicks = [];
+      activePreview = null;
+      creating = null;
+    }
+    setActivePane(paneId);
+    setDrawCtxForPane(paneId);
+    drawTargetPane = paneId;
+    const r = container.getBoundingClientRect();
+    const x = e.clientX - r.left, y = e.clientY - r.top, ps = paneSize();
+    if (x < 0 || y < 0 || x > ps.w || y > ps.h) return;
+    const pt = pxToData(x, y);
+    if (!pt) return;
+    e.stopPropagation(); e.preventDefault();
+
+    if (isPosTool(currentDrawTool)) {
+      const sh = makeShape(currentDrawTool, pt, { time: pt.time, price: pt.price });
+      sh.p2 = posP2(sh);
+      finishShape(sh);
+      return;
+    }
+    if (isAxisTool(currentDrawTool)) {
+      finishShape(makeShape(currentDrawTool, pt, { time: pt.time, price: pt.price }));
+      return;
+    }
+    if (drawClicks.length === 0) {
+      drawClicks = [pt];
+      creating = { sx: e.clientX, sy: e.clientY, pane: paneId };
+      activePreview = null;
+      if (paneId === 1) dirty2 = true; else dirty = true;
+    } else {
+      finishTwoPoint(pt);
+    }
+  }, true);
+
+  svg.addEventListener('mousedown', (e) => {
+    if (e.button !== 0 || currentDrawTool) return;
+    const t = e.target;
+    const sid = parseInt(t.getAttribute('data-sid'), 10);
+    if (!sid) return;
+    const list = paneId === 1 ? (pane2 ? pane2.drawings : []) : drawings;
+    const s = list.find(d => d && d.id === sid);
+    if (!s) return;
+    e.stopPropagation(); e.preventDefault();
+    closePopup();
+    setActivePane(paneId);
+    setDrawCtxForPane(paneId);
+    selectedPane2Id = paneId === 1 ? sid : null;
+    if (selectedShapeId !== sid) selectShape(sid);
+    if (s.locked) return;
+    dragState = {
+      sid, pane: paneId, h: t.getAttribute('data-h') || null,
+      sx: e.clientX, sy: e.clientY, orig: clone(s), moved: false
+    };
+  });
+
+  svg.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const noteId = parseInt(e.target.getAttribute('data-note-edit'), 10);
+    if (!noteId || selectedShapeId !== noteId) return;
+    if (window._noteDidDrag) { window._noteDidDrag = false; return; }
+    setDrawCtxForPane(paneId);
+    const s = findShape(noteId);
+    if (s && s.tool === 'note') startNoteInlineEdit(s);
+  });
+
+  svg.addEventListener('dblclick', (e) => {
+    e.stopPropagation();
+    const sid = parseInt(e.target.getAttribute('data-sid'), 10);
+    if (!sid) return;
+    setDrawCtxForPane(paneId);
+    const s = findShape(sid);
+    if (!s) return;
+    if (s.tool === 'note') { startNoteInlineEdit(s); return; }
+    openDialog(s, null);
+  });
+
+  container.addEventListener('click', (e) => {
+    if (currentDrawTool || e.target.closest('.dt-toolbar, #editToolbar, .pane-chrome')) return;
+    if (downPos && Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y) > 4) return;
+    if (selectedShapeId !== null) deselect();
+  });
+}
+
+// Single global mousemove / mouseup — zero collision between Chart 1 and Chart 2
 document.addEventListener('mousemove', (e) => {
-  const r = chartContainer.getBoundingClientRect();
   if (dragState) {
-    const s = findShape(dragState.sid);
+    const pId = dragState.pane;
+    setDrawCtxForPane(pId);
+    const s = dDrawings().find(d => d && d.id === dragState.sid);
     if (!s) return;
     if (Math.abs(e.clientX - dragState.sx) > 3 || Math.abs(e.clientY - dragState.sy) > 3) {
       dragState.moved = true;
       if (s.tool === 'note') window._noteDidDrag = true;
     }
+    const r = dContainer().getBoundingClientRect();
     if (dragState.h) {
       const pt = pxToData(e.clientX - r.left, e.clientY - r.top);
       if (pt) setHandle(s, dragState.h, pt.time, pt.price);
     } else {
       moveShape(s, dragState.orig, e.clientX - dragState.sx, e.clientY - dragState.sy);
     }
-    syncDialog(); dirty = true;
+    syncDialog();
+    if (pId === 1) dirty2 = true; else dirty = true;
     return;
   }
   if (currentDrawTool && drawClicks.length === 1) {
+    const pId = creating ? creating.pane : drawTargetPane;
+    setDrawCtxForPane(pId);
+    const r = dContainer().getBoundingClientRect();
     const pt = pxToData(e.clientX - r.left, e.clientY - r.top);
     if (pt) {
       if (isShiftDown && currentDrawTool === 'line') pt.price = drawClicks[0].price;
-      activePreview = pt; dirty = true;
+      activePreview = pt;
+      if (pId === 1) dirty2 = true; else dirty = true;
     }
   }
 });
+
 document.addEventListener('mouseup', (e) => {
-  if (dragState) { const ds = findShape(dragState.sid); if (ds && isPosTool(ds.tool)) rememberPosSize(ds); }
-  dragState = null;
+  if (dragState) {
+    const pId = dragState.pane;
+    setDrawCtxForPane(pId);
+    const ds = dDrawings().find(d => d && d.id === dragState.sid);
+    if (ds && isPosTool(ds.tool)) rememberPosSize(ds);
+    const moved = dragState.moved;
+    dragState = null;
+    if (moved) schedulePersist();
+    if (pId === 1) dirty2 = true; else dirty = true;
+  }
   if (creating) {
+    const pId = creating.pane;
     const moved = Math.hypot(e.clientX - creating.sx, e.clientY - creating.sy);
     creating = null;
-    if (moved > 6 && drawClicks.length === 1) { // click-drag-release also works
-      const r = chartContainer.getBoundingClientRect();
+    if (moved > 6 && drawClicks.length === 1) {
+      setDrawCtxForPane(pId);
+      drawTargetPane = pId;
+      const r = dContainer().getBoundingClientRect();
       const pt = pxToData(e.clientX - r.left, e.clientY - r.top);
       if (pt) finishTwoPoint(pt);
     }
   }
 });
-// click on empty chart space deselects (ignoring pans)
-let downPos = null;
-chartContainer.addEventListener('mousedown', (e) => { downPos = { x: e.clientX, y: e.clientY }; });
-chartContainer.addEventListener('click', (e) => {
-  if (currentDrawTool || e.target.closest('.dt-toolbar, #editToolbar')) return;
-  if (downPos && Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y) > 4) return;
-  if (selectedShapeId !== null) deselect();
-});
+
+bindPaneDrawingEvents(0, chartContainer, svgOverlay);
 
 // ========== RENDERING ==========
 function addText(parent, lines, x, y, anchor, s, rotate) {
@@ -2554,7 +3714,7 @@ function renderFib(s, g, c, pw) {
     v: l.v, color: s.oneColor ? s.oneColorValue : l.color,
     price: s.p2.price + (s.p1.price - s.p2.price) * l.v
   }));
-  lv.forEach(l => { l.y = candleSeries.priceToCoordinate(l.price); });
+  lv.forEach(l => { l.y = dSeries().priceToCoordinate(l.price); });
   const valid = lv.filter(l => l.y !== null).sort((a, b) => a.v - b.v);
   if (s.bg) {
     for (let i = 1; i < valid.length; i++) {
@@ -2577,7 +3737,7 @@ function renderFib(s, g, c, pw) {
 function renderPosition(s, g, c, selected) {
   const long = s.tool === 'long';
   const entryY = c.y1;
-  const tpY = candleSeries.priceToCoordinate(s.tpPrice), slY = candleSeries.priceToCoordinate(s.slPrice);
+  const tpY = dSeries().priceToCoordinate(s.tpPrice), slY = dSeries().priceToCoordinate(s.slPrice);
   if (tpY === null || slY === null) return null;
   const x1 = Math.min(c.x1, c.x2), x2 = Math.max(c.x1, c.x2), w = Math.max(2, x2 - x1), mx = x1 + w / 2;
   const entry = s.p1.price;
@@ -2594,7 +3754,7 @@ function renderPosition(s, g, c, selected) {
   // Path opacity: band from entry → last price inside the tool, mapped by TIME RATIO
   // so it works the same on every timeframe (no dependency on 1m bar X coords)
   if (trk) {
-    const priceY = candleSeries.priceToCoordinate(trk.lastPrice);
+    const priceY = dSeries().priceToCoordinate(trk.lastPrice);
     if (priceY !== null && isFinite(priceY)) {
       const tStart = getComparableTime(s.p1.time);
       const tBoxEnd = trk.boxEndT != null ? trk.boxEndT : positionBoxEndTime(s);
@@ -2693,24 +3853,25 @@ function priceMarks(s) {
   return [{ price: s.p1.price, color: '#2962ff' }, { price: s.p2.price, color: '#2962ff' }];
 }
 function renderAxisHighlight(s, c, pw, ph, W, H) {
-  const tsH = chart.timeScale().height() || (H - ph), ty = H - tsH;
-  const marks = priceMarks(s).map(m => ({ ...m, y: candleSeries.priceToCoordinate(m.price) })).filter(m => m.y !== null);
+  const svg = dSvg();
+  const tsH = dChart().timeScale().height() || (H - ph), ty = H - tsH;
+  const marks = priceMarks(s).map(m => ({ ...m, y: dSeries().priceToCoordinate(m.price) })).filter(m => m.y !== null);
   if (marks.length) {
     const ys = marks.map(m => m.y), top = Math.min(...ys), bot = Math.max(...ys);
-    mk('rect', { x: pw, y: top, width: W - pw, height: bot - top, fill: 'rgba(41,98,255,0.28)' }, svgOverlay).style.pointerEvents = 'none';
+    mk('rect', { x: pw, y: top, width: W - pw, height: bot - top, fill: 'rgba(41,98,255,0.28)' }, svg).style.pointerEvents = 'none';
     marks.forEach(m => {
-      mk('rect', { x: pw + 1, y: m.y - 9, width: W - pw - 2, height: 18, fill: m.color }, svgOverlay).style.pointerEvents = 'none';
-      const t = mk('text', { x: pw + (W - pw) / 2, y: m.y + 4, 'text-anchor': 'middle', 'font-size': 11, 'font-family': UI_FONT, fill: '#fff' }, svgOverlay);
+      mk('rect', { x: pw + 1, y: m.y - 9, width: W - pw - 2, height: 18, fill: m.color }, svg).style.pointerEvents = 'none';
+      const t = mk('text', { x: pw + (W - pw) / 2, y: m.y + 4, 'text-anchor': 'middle', 'font-size': 11, 'font-family': UI_FONT, fill: '#fff' }, svg);
       t.textContent = fmtP(m.price); t.style.pointerEvents = 'none';
     });
   }
   const xs = [{ x: c.x1, t: s.p1.time }, { x: c.x2, t: s.p2.time }];
   const xl = Math.min(c.x1, c.x2), xr = Math.max(c.x1, c.x2);
-  mk('rect', { x: xl, y: ty, width: xr - xl, height: tsH, fill: 'rgba(41,98,255,0.28)' }, svgOverlay).style.pointerEvents = 'none';
+  mk('rect', { x: xl, y: ty, width: xr - xl, height: tsH, fill: 'rgba(41,98,255,0.28)' }, svg).style.pointerEvents = 'none';
   xs.forEach(m => {
     const label = fmtAxisTime(m.t), w = label.length * 6.3 + 14;
-    mk('rect', { x: m.x - w / 2, y: ty + 1, width: w, height: tsH - 2, fill: '#2962ff' }, svgOverlay).style.pointerEvents = 'none';
-    const t = mk('text', { x: m.x, y: ty + tsH / 2 + 4, 'text-anchor': 'middle', 'font-size': 11, 'font-family': UI_FONT, fill: '#fff' }, svgOverlay);
+    mk('rect', { x: m.x - w / 2, y: ty + 1, width: w, height: tsH - 2, fill: '#2962ff' }, svg).style.pointerEvents = 'none';
+    const t = mk('text', { x: m.x, y: ty + tsH / 2 + 4, 'text-anchor': 'middle', 'font-size': 11, 'font-family': UI_FONT, fill: '#fff' }, svg);
     t.textContent = label; t.style.pointerEvents = 'none';
   });
 }
@@ -2769,19 +3930,31 @@ function renderNote(s, g, c) {
 }
 
 function render() {
-  svgOverlay.innerHTML = '';
+  // Chart 1
+  setDrawCtxPrimary();
+  renderActiveDrawings(0);
+  // Chart 2 — exact same engine
+  if (splitOn && pane2 && pane2.shownData && pane2.shownData.length) {
+    setDrawCtxPane2();
+    renderActiveDrawings(1);
+    setDrawCtxPrimary();
+  }
+}
+function renderActiveDrawings(paneId = 0) {
+  const svg = dSvg();
+  svg.innerHTML = '';
   if (selectedShapeId !== null && !findShape(selectedShapeId)) deselect();
-  if (!currentDataCache.length) return;
+  if (!dShown() || !dShown().length) return;
   const { w: pw, h: ph } = paneSize();
-  const W = chartContainer.clientWidth, H = chartContainer.clientHeight;
-  const defs = mk('defs', {}, svgOverlay);
-  const cp = mk('clipPath', { id: 'paneClip' }, defs);
+  const W = dContainer().clientWidth, H = dContainer().clientHeight;
+  const defs = mk('defs', {}, svg);
+  const clipId = _drawClipId || 'paneClip';
+  const cp = mk('clipPath', { id: clipId }, defs);
   mk('rect', { x: 0, y: 0, width: pw, height: ph }, cp);
-  const layer = mk('g', { 'clip-path': 'url(#paneClip)' }, svgOverlay);
+  const layer = mk('g', { 'clip-path': 'url(#' + clipId + ')' }, svg);
   const cat = tfCategory();
-  const all = drawings.filter(d => ensureVis(d).vis[cat] !== false);
-  if (selectedShapeId !== null && !all.some(d => d.id === selectedShapeId)) deselect();
-  if (currentDrawTool && !isPosTool(currentDrawTool) && drawClicks.length === 1 && activePreview) {
+  const all = dDrawings().filter(d => ensureVis(d).vis[cat] !== false);
+  if (currentDrawTool && !isPosTool(currentDrawTool) && drawClicks.length === 1 && activePreview && drawTargetPane === paneId) {
     const pv = makeShape(currentDrawTool, drawClicks[0], activePreview);
     pv.id = 'preview'; pv.isPreview = true; nextShapeId--;
     all.push(pv);
@@ -2823,7 +3996,7 @@ function render() {
     const cc = pos ? { x1: pos.x1, x2: pos.x2 } : c;
     renderAxisHighlight(s, { x1: cc.x1, x2: cc.x2 }, pw, ph, W, H);
     if (!s.locked) {
-      const hg = mk('g', {}, svgOverlay);
+      const hg = mk('g', {}, svg);
       getHandles(s, c, pos).forEach(h => {
         if (h.x < -6 || h.x > pw + 6 || h.y < -6 || h.y > ph + 6) return;
         const el = mk('circle', { cx: h.x, cy: h.y, r: 5.5, class: 'dt-handle', 'data-sid': s.id, 'data-h': h.id }, hg);
@@ -2832,10 +4005,11 @@ function render() {
     }
   }
 
-  // Indicator boxes (any plot with type: 'box')
-  renderIndicatorBoxes(layer, pw);
-  // Volume profile (horizontal volume-at-price bars)
-  renderVolumeProfiles(layer, pw);
+  // Indicator boxes & volume profile on primary pane
+  if (paneId === 0) {
+    renderIndicatorBoxes(layer, pw);
+    renderVolumeProfiles(layer, pw);
+  }
 }
 
 function renderIndicatorBoxes(layer, pw) {
@@ -2978,12 +4152,38 @@ function viewSignature() {
   return [lr ? lr.from : '', lr ? lr.to : '', candleSeries.priceToCoordinate(0), candleSeries.priceToCoordinate(1000),
     chartContainer.clientWidth, chartContainer.clientHeight, currentDataCache.length].join('|');
 }
+let lastPane2Sig = '';
+function pane2ViewSignature() {
+  if (!pane2) return '';
+  try {
+    const lr = pane2.chart.timeScale().getVisibleLogicalRange();
+    const p0 = pane2.candleSeries.priceToCoordinate(0);
+    const p1 = pane2.candleSeries.priceToCoordinate(1000);
+    return [lr ? lr.from : '', lr ? lr.to : '', p0, p1, pane2.shownData.length, selectedPane2Id, pane2.drawings.length].join('|');
+  } catch (e) { return String(pane2.drawings.length); }
+}
 function drawLoop() {
-  const sig = viewSignature();
-  if (dirty || sig !== lastSig) {
-    const changed = dirty;
-    lastSig = sig; dirty = false; render();
-    if (changed && persistReady && persistSignature() !== lastPersistSig) schedulePersist();
+  const sig1 = viewSignature();
+  const need1 = dirty || sig1 !== lastSig;
+
+  const p2sig = (splitOn && pane2) ? pane2ViewSignature() : '';
+  const need2 = splitOn && pane2 && (dirty || dirty2 || p2sig !== lastPane2Sig);
+
+  if (need1) {
+    lastSig = sig1;
+    setDrawCtxPrimary();
+    renderActiveDrawings(0);
+  }
+  if (need2) {
+    lastPane2Sig = p2sig;
+    dirty2 = false;
+    setDrawCtxPane2();
+    renderActiveDrawings(1);
+    setDrawCtxPrimary();
+  }
+  if (dirty) {
+    dirty = false;
+    if (persistReady && persistSignature() !== lastPersistSig) schedulePersist();
   }
   requestAnimationFrame(drawLoop);
 }
@@ -3015,38 +4215,16 @@ chart.subscribeClick((param) => {
     document.getElementById('btn-select-bar').classList.remove('active');
     chartContainer.style.cursor = 'default';
     applyTimeframe(currentTimeframe, true);
+    if (splitOn && pane2 && pane2.rawCandles.length) {
+      try { pane2AdvanceReplay(replayTimestamp); } catch (e) { /* ignore */ }
+    }
   }
 });
 
 // ========== RIGHT PRICE SCALE: MOUSE WHEEL ==========
 // Wheel over the price axis zooms the price scale (TradingView behaviour).
 // Shift + wheel scrolls the price scale up / down. Double-click the axis to reset to auto.
-chartContainer.addEventListener('wheel', (e) => {
-  const r = chartContainer.getBoundingClientRect();
-  const { w: pw, h: ph } = paneSize();
-  const x = e.clientX - r.left, y = e.clientY - r.top;
-  if (x <= pw || x > r.width || y < 0 || y > ph) return; // not over the right price scale
-  e.preventDefault(); e.stopPropagation();
-  const scale = chart.priceScale('right');
-  const range = scale.getVisibleRange();
-  if (!range || !isFinite(range.from) || !isFinite(range.to) || range.to === range.from) return;
-  let dy = e.deltaY || e.deltaX;
-  if (e.deltaMode === 1) dy *= 33; else if (e.deltaMode === 2) dy *= 400;
-  const span = range.to - range.from;
-  let from, to;
-  if (e.shiftKey) { // scroll
-    const shift = (dy / Math.max(ph, 1)) * span;
-    from = range.from + shift; to = range.to + shift;
-  } else { // zoom around the centre of the visible range
-    const factor = Math.min(Math.max(Math.exp(dy * 0.0015), 0.5), 2);
-    const mid = (range.from + range.to) / 2, half = (span / 2) * factor;
-    from = mid - half; to = mid + half;
-  }
-  scale.applyOptions({ autoScale: false });
-  scale.setVisibleRange({ from, to });
-  markPriceScaleManual();
-  dirty = true;
-}, { passive: false, capture: true });
+attachPriceScaleWheel(chartContainer, chart, candleSeries, markPriceScaleManual);
 
 // Dragging the right price axis → manual mode
 chartContainer.addEventListener('mousedown', (e) => {
@@ -3230,7 +4408,11 @@ function syncChartDialog() {
   const g2 = chartDialog.querySelector('[data-sw="bgColor2"]');
   if (g2) g2.style.display = chartCfg.bgType === 'gradient' ? '' : 'none';
 }
-function commitChartCfg() { applyChartSettings(chartCfg); syncChartDialog(); dirty = true; }
+function commitChartCfg() {
+  applyChartSettings(chartCfg);
+  try { if (pane2) applyChartSettingsTo(pane2.chart, pane2.candleSeries, chartCfg); } catch (e) { /* ignore */ }
+  syncChartDialog(); dirty = true;
+}
 
 chartDialog.addEventListener('click', (e) => {
   const t = e.target.closest('button');
@@ -3799,6 +4981,8 @@ function loadIndicators() {
 }
 function saveIndicators() {
   try { localStorage.setItem(IND_KEY, JSON.stringify({ lib: customIndicators.map(({ id, name, code }) => ({ id, name, code })), inst: indInst })); } catch (e) { /* storage unavailable */ }
+  try { if (typeof syncPane2IndCatalog === 'function') syncPane2IndCatalog(); } catch (e) { /* pane2 optional */ }
+  try { if (typeof refreshPaneIndBadges === 'function') refreshPaneIndBadges(); } catch (e) { /* chrome may not exist yet */ }
 }
 loadIndicators();
 
@@ -4327,11 +5511,12 @@ function resetChartView() {
 // ---- Undo stack (drawings + replay cursor + timeframe) ----
 const UNDO_MAX = 40;
 let undoStack = [];
-function pushUndo(label) {
+function pushUndo(label, cursorOnly = false) {
   try {
     const snap = {
       label: label || 'action',
-      drawings: JSON.parse(JSON.stringify(drawings)),
+      drawings: cursorOnly ? null : JSON.parse(JSON.stringify(drawings)),
+      pane2Drawings: (cursorOnly || !pane2) ? null : JSON.parse(JSON.stringify(pane2.drawings)),
       nextShapeId,
       selectedShapeId,
       currentTimeframe,
@@ -4345,10 +5530,16 @@ function pushUndo(label) {
 function performUndo() {
   if (!undoStack.length) { trToast('Nothing to undo'); return; }
   const snap = undoStack.pop();
-  drawings = Array.isArray(snap.drawings) ? snap.drawings : [];
+  if (snap.drawings !== null) {
+    drawings = Array.isArray(snap.drawings) ? snap.drawings : [];
+    dirty = true;
+  }
+  if (snap.pane2Drawings !== null && pane2) {
+    pane2.drawings = Array.isArray(snap.pane2Drawings) ? snap.pane2Drawings : [];
+    dirty2 = true;
+  }
   nextShapeId = snap.nextShapeId || nextShapeId;
   selectedShapeId = snap.selectedShapeId || null;
-  dirty = true;
   deselect();
   // Restore timeframe if it changed
   if (snap.currentTimeframe && snap.currentTimeframe !== currentTimeframe) {
@@ -4365,11 +5556,13 @@ function performUndo() {
       candleSeries.setData(rebuilt);
       shownData = rebuilt;
       displayLen = rebuilt.length;
-      ctRef = null;
       updateStatusBar(shownData);
       dirty = true;
       scheduleIndicatorSync(80);
       updateGoToLatestBtn();
+      if (splitOn && pane2 && pane2.rawCandles.length) {
+        try { pane2AdvanceReplay(replayTimestamp); } catch (e) { /* ignore */ }
+      }
     }
   }
   schedulePersist();
@@ -4389,7 +5582,7 @@ document.addEventListener('keydown', (e) => {
   if (!typing && !e.altKey && !e.ctrlKey && !e.metaKey && e.code === 'ArrowRight' && replayTimestamp != null) {
     if (ivOpen || anyDialogOpen()) return;
     e.preventDefault();
-    pushUndo('replay skip');
+    pushUndo('replay skip', true);
     stepReplay(1);
     return;
   }
@@ -4536,10 +5729,18 @@ async function clearCandleData() {
 })();
 
 async function setTimeframe(tf) {
-  if (tf === currentTimeframe) return; // ignore no-op clicks
+  // Timeframes are always independent per pane. Active pane decides which one changes.
+  if (splitOn && activePaneId === 1 && pane2) {
+    if (pane2.currentTimeframe === tf) { updateTfButtonsHighlight(); return; }
+    pane2ApplyTf(tf);
+    updateTfButtonsHighlight();
+    return;
+  }
+  if (tf === currentTimeframe) { updateTfButtonsHighlight(); return; }
   pushUndo('timeframe ' + tf);
   applyTimeframe(tf, false, true);
   await saveCurrentTfToDB(tf);
+  updateTfButtonsHighlight();
 }
 document.getElementById('timeframes').addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-tf]');
@@ -5340,6 +6541,13 @@ async function init() {
     if (st.toolStyles && typeof st.toolStyles === 'object') toolStyles = st.toolStyles;
     nextShapeId = Math.max(drawings.reduce((m, d) => Math.max(m, d.id || 0), 0) + 1, st.nextShapeId || 1);
     if (rawCandles.length && typeof st.replayTs === 'number') replayTimestamp = st.replayTs; // resume replay where it was
+    pendingPane2State = {
+      pane2Raw: st.pane2Raw || [],
+      pane2Drawings: st.pane2Drawings || [],
+      pane2Tf: st.pane2Tf || '1',
+      pane2Symbol: st.pane2Symbol || '',
+      pane2ReplayTs: st.pane2ReplayTs
+    };
     document.querySelectorAll('.timeframes button').forEach(btn => btn.classList.toggle('active', btn.dataset.tf === currentTimeframe));
     if (rawCandles.length) {
       applyTimeframe(currentTimeframe);
@@ -5358,5 +6566,17 @@ async function init() {
   dirty = true;
   lastPersistSig = persistSignature();
   persistReady = true;
+  try { refreshPaneIndBadges(); } catch (e) { /* ignore */ }
+  // Force chart to measure its container (prevents blank 0-height canvas)
+  requestAnimationFrame(() => {
+    try {
+      const el = document.getElementById('chart');
+      if (el) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) chart.applyOptions({ width: r.width, height: r.height });
+      }
+      window.dispatchEvent(new Event('resize'));
+    } catch (e) { /* ignore */ }
+  });
 }
 init();

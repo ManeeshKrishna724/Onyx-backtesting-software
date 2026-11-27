@@ -90,8 +90,26 @@ body {
 .btn-icon:hover { background: var(--surface-2); color: #fff; border-color: #343d51; }
 
 /* ----- chart area ----- */
-.chart-shell { flex: 1; min-height: 0; display: flex; }
-.chart-container { flex: 1; width: 100%; min-height: 0; position: relative; overflow: hidden; }
+.chart-shell {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  overflow: hidden;
+}
+.chart-shell.split-on {
+  flex-direction: row;
+}
+.chart-container {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+}
 
 /* ----- footer / status bar (fixed under the chart) ----- */
 .statusbar {
@@ -354,13 +372,13 @@ input:disabled + .box { opacity: 0.6; }
 .dlg-btn.primary:hover { background: #e6e6e6; }
 
 /* ----- SVG shapes (overrides the older generic overlay rules) ----- */
-#svg-overlay * { pointer-events: none; cursor: default; }
-#svg-overlay .hit { pointer-events: all; cursor: pointer; }
-#svg-overlay .hit.hit-stroke { pointer-events: stroke; }
-#svg-overlay .dt-handle {
+#svg-overlay *, .chart-container > svg * { pointer-events: none; cursor: default; }
+#svg-overlay .hit, .chart-container > svg .hit { pointer-events: all; cursor: pointer; }
+#svg-overlay .hit.hit-stroke, .chart-container > svg .hit.hit-stroke { pointer-events: stroke; }
+#svg-overlay .dt-handle, .chart-container > svg .dt-handle {
   pointer-events: all; fill: #131722; stroke: #2962ff; stroke-width: 2px;
 }
-.drawing-mode #svg-overlay * { pointer-events: none !important; }
+.drawing-mode #svg-overlay *, .drawing-mode .chart-container > svg * { pointer-events: none !important; }
 
 
 /* ----- chart settings dialog additions ----- */
@@ -369,12 +387,12 @@ input:disabled + .box { opacity: 0.6; }
 .dlg-foot .cs-reset { margin-right: auto; }
 
 
-/* ----- vertical drawing toolbar: roomier buttons (ids win over the earlier shared rules) ----- */
+/* ----- vertical drawing toolbar: roomier buttons ----- */
 #drawToolbar { gap: 8px; padding: 6px 6px 12px; }
 #drawToolbar .dt-grip { width: 42px; height: 20px; }
 #drawToolbar .draw-btn { width: 42px; height: 42px; min-width: 42px; padding: 0; border-radius: 9px; }
 #drawToolbar .draw-btn svg { width: 25px; height: 25px; }
-#drawToolbar #btn-clear-draw svg, #drawToolbar #btn-toolbar-orient svg { width: 18px; height: 18px; }
+#drawToolbar .dt-clear-btn svg, #drawToolbar .dt-orient-btn svg { width: 18px; height: 18px; }
 #drawToolbar .dt-sep { width: 26px; margin: 4px 0; }
 
 
@@ -705,3 +723,183 @@ input:disabled + .box { opacity: 0.6; }
 .clear-menu button { white-space: nowrap; }
 .clear-menu button.danger { color: #ff7b86; }
 .clear-menu button.danger span { color: rgba(255, 123, 134, 0.65); }
+
+/* =====================================================================
+   SPLIT CHART (side-by-side panes + resizable divider)
+   ===================================================================== */
+.chart-shell.split-on {
+  flex-direction: row;
+  align-items: stretch;
+}
+.chart-pane {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  overflow: hidden;
+}
+.chart-pane.active {
+  outline: 1px solid rgba(61, 107, 255, 0.35);
+  outline-offset: -1px;
+}
+.chart-pane .chart-container {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  position: relative;
+  overflow: hidden;
+}
+.pane-chrome {
+  flex: none;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+.pane-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.pane-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.pane-actions .btn {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+  border-radius: 7px;
+}
+.pane-actions .btn svg { flex: none; }
+
+.split-divider {
+  flex: none;
+  width: 4px;
+  margin: 0;
+  padding: 0;
+  background: #000;
+  cursor: col-resize;
+  position: relative;
+  z-index: 20;
+  transition: background 0.12s;
+}
+.split-divider:hover,
+.split-divider.dragging {
+  background: #3d6bff;
+}
+.split-divider::after {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0;
+  left: -4px; right: -4px;
+}
+
+/* indicator badge (top-left of each pane) */
+.pane-ind-wrap { position: relative; flex: none; }
+.pane-ind-badge {
+  width: 24px; height: 24px; padding: 0;
+  border-radius: 6px; border: 1px solid var(--border);
+  background: var(--surface-2); color: var(--text);
+  font-size: 11px; font-weight: 700; font-family: inherit;
+  display: grid; place-items: center; cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.pane-ind-badge:hover,
+.pane-ind-badge.open {
+  background: rgba(61, 107, 255, 0.2);
+  border-color: rgba(61, 107, 255, 0.5);
+  color: #a9bcff;
+}
+.pane-ind-menu {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 1400;
+  min-width: 240px; max-width: 320px;
+  background: #171b25; border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55); padding: 6px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.pane-ind-menu[hidden] { display: none !important; }
+.pane-ind-menu .pim-empty {
+  padding: 10px 12px; color: var(--muted); font-size: 12px;
+}
+.pane-ind-menu .pim-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 8px; border-radius: 7px;
+}
+.pane-ind-menu .pim-row:hover { background: rgba(255, 255, 255, 0.06); }
+.pane-ind-menu .pim-name {
+  flex: 1; min-width: 0; font-size: 12.5px; font-weight: 600; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pane-ind-menu .pim-ico {
+  width: 26px; height: 26px; display: grid; place-items: center;
+  background: none; border: 0; border-radius: 6px; color: #b5b5b5; cursor: pointer;
+}
+.pane-ind-menu .pim-ico:hover { background: #2a3140; color: #fff; }
+.pane-ind-menu .pim-ico.off { opacity: 0.35; }
+
+#splitBtn.active {
+  background: rgba(61, 107, 255, 0.2);
+  border-color: rgba(61, 107, 255, 0.55);
+  color: #a9bcff;
+}
+
+#syncChartBtn.active {
+  background: rgba(61, 107, 255, 0.22);
+  border-color: rgba(61, 107, 255, 0.55);
+  color: #a9bcff;
+}
+#priceResetBtn2:hover {
+  background: #2962ff !important;
+  border-color: #2962ff !important;
+  color: #fff !important;
+}
+.pane-clear-btn {
+  height: 26px !important;
+  padding: 0 10px !important;
+  font-size: 12px !important;
+}
+
+
+
+.chart-shell:not(.split-on) .pane-chrome { display: none !important; }
+.chart-shell:not(.split-on) .chart-pane { flex: 1 1 auto; width: 100%; height: 100%; }
+.chart-pane .chart-container { flex: 1 1 auto; min-height: 0; height: 100%; width: 100%; }
+
+#svg-overlay, #svg-overlay-2, .chart-container > svg {
+  position: absolute !important;
+  inset: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  z-index: 5 !important;
+  pointer-events: none !important;
+}
+#svg-overlay .hit[data-sid], #svg-overlay-2 .hit[data-sid] {
+  pointer-events: all !important;
+  cursor: pointer;
+}
+#svg-overlay .hit.hit-stroke[data-sid], #svg-overlay-2 .hit.hit-stroke[data-sid] {
+  pointer-events: stroke !important;
+  cursor: pointer;
+}
+#svg-overlay .dt-handle[data-sid], #svg-overlay-2 .dt-handle[data-sid] {
+  pointer-events: all !important;
+  fill: #131722;
+  stroke: #2962ff;
+  stroke-width: 2px;
+}
+.chart-container.drawing-mode > svg * {
+  pointer-events: none !important;
+}
